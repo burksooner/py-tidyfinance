@@ -20,7 +20,9 @@ jobs:
           python-version: '3.12'
 
       - name: Build sdist and wheel
-        run: uv build
+        run: |
+          rm -rf dist
+          uv build
 
       - name: Check package metadata
         run: uvx twine check dist/*
