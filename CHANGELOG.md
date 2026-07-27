@@ -1,62 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- **Polars backend returns WRDS date columns as `Date` (#66):** With
-  `set_backend("polars")`, the calendar-date columns of the WRDS
-  downloads (`trd_exctn_dt` from `trace_enhanced`, `datadate` from
-  Compustat, `linkdt`/`linkenddt` from CCM links, `calculation_date`
-  from monthly CRSP, and the FISD date columns) are now cast to
-  `polars.Date` instead of surfacing as `polars.Datetime`, matching
-  the R package and the existing normalization of the `date` column.
-  This fixes `SchemaError`s when joining or vertically stacking TRACE
-  output against `Date`-typed frames. True time-of-day columns (e.g.
-  `trd_exctn_tm`) and timezone-aware datetimes are unaffected.
-- **Added FRED-MD and FRED-QD macroeconomic databases:**
-  `download_data("FRED", "FRED-MD")` and `download_data("FRED", "FRED-QD")`
-  download the McCracken and Ng (2016, 2021) curated monthly / quarterly
-  macro panels as wide tables (one column per series). `transform=True`
-  applies each series' stationarity transform code (tcode). `vintage`
-  selects the current release (default), a specific `"YYYY-MM"` release, or
-  `"all"` — the full real-time panel across every archived vintage (recent
-  vintages are hosted individually; older ones are read from the St. Louis
-  Fed vintage archive zips), enabling leak-free point-in-time analysis.
-- **Added Global Factor Data, Pastor-Stambaugh, and Stambaugh-Yuan
-  downloads:** `download_data("Global Factor Data")` downloads
-  characteristic-managed portfolio returns, the underlying long-short
-  portfolios, industry returns, or reference cutoff files from
-  [Global Factor Data](https://jkpfactors.com/data) (Jensen, Kelly, and
-  Pedersen, 2023); the requested selection is validated against the
-  library's live availability manifest, and
-  `list_supported_jkp_factors()` lists the available regions and
-  factors. `download_data("Pastor-Stambaugh")` downloads the liquidity
-  factors of Pastor and Stambaugh (2003). `download_data("Stambaugh-Yuan")`
-  downloads the mispricing factors of Stambaugh and Yuan (2017), with a
-  `dataset` argument selecting `"monthly"` (default) or `"daily"` data.
-- **OSAP download aligned with beginning-of-month and scaled returns:**
-  `download_data("Open Source Asset Pricing")` now aligns the `date`
-  column to the beginning of the month (the dataset previously returned
-  end-of-month dates), matching the convention used by the other
-  download functions. All predictor columns are monthly long-short
-  returns expressed in percent and are now divided by 100 to return
-  plain numeric (decimal) returns.
-- **`sorting_variable` is now optional for `factor_library`:** Calling
-  `download_data("Tidy Finance", "factor_library")` without a
-  `sorting_variable` now returns the default portfolio construction for
-  all sorting variables instead of raising an error. Other defaults
-  (e.g. `rebalancing`, `weighting_scheme`) still apply; pass
-  `fill_all=True` to leave every column unrestricted. Passing `None` for
-  any filter column now removes that filter entirely and returns all
-  values for that column (e.g. `min_size_quantile=None` includes all
-  size groups), matching the R package's `NULL` behavior.
-- **Added `detail` parameter to `estimate_fama_macbeth`:** matching the R
-  package, passing `detail=True` returns a dict with `coefficients` (the
-  usual risk premium estimates) and `summary_statistics` (a one-row data
-  frame with the mean cross-sectional `r_squared`, `adj_r_squared`, and
-  `n_obs` across all per-period regressions). The default (`detail=False`)
-  behavior — returning only the coefficients data frame — is unchanged.
-- **Dependencies (replaced pyfixest with formulaic):** The `pyfixest` dependency was dropped in favor of [`formulaic`](https://github.com/matthewwardrop/formulaic) plus a small internal numpy OLS helper (`_fit_ols`). `pyfixest` was used only for plain OLS with classical (IID) standard errors in `estimate_model` and the cross-sectional / IID-variance steps of `estimate_fama_macbeth`, but it pulled in `great-tables` → `multimark`, a `cffi` C-extension that ships no Python 3.14 wheels and therefore required a C/C++ toolchain (e.g. MSVC Build Tools on Windows) to install on unsupported interpreters. `_fit_ols` builds the design matrix via `formulaic` and reproduces `feols` coefficients, standard errors, t-statistics, and residuals to ~1e-9 for models without fixed effects, so results are unchanged. Note that `estimate_model` and `estimate_fama_macbeth` now perform classical OLS only (the fixed-effects / clustered-SE features of `pyfixest` were never used and are no longer available).
-
 ## v0.1.0
 
 - Development version
@@ -106,3 +49,13 @@
 - **Fix (TRACE regime cutoff):** `process_trace_data` now uses the correct Dick-Nielsen (2014) enhanced-TRACE regime cutoff of `2012-02-06` (was the transposed `2012-06-02`). Samples spanning Feb 6 – Jun 2, 2012 were previously cleaned under the wrong cancellation/correction/reversal regime, producing incorrect output; samples entirely after June 2012 were unaffected. This aligns the Python edition with r-tidyfinance's `download_data_wrds_trace_enhanced()` (#34).
 - `download_data()` now uses the human-readable domain names returned by `list_supported_datasets()` (e.g., `"Fama-French"`, `"Global Q"`, `"WRDS"`, `"Tidy Finance"`). The `"pseudo"` and `"tidyfinance"` domains were renamed to `"Pseudo Data"` and `"Tidy Finance"`. The previous machine-readable domain names (e.g., `"famafrench"`, `"wrds"`, `"pseudo"`, `"tidyfinance"`) are soft-deprecated but still accepted.
 - **Breaking (package API):** the dataset-specific `_download_data_*` helpers (e.g. `_download_data_wrds`, `_download_data_macro_predictors`, `_download_data_constituents`, `_download_data_factors_ff`, `_download_data_factors_q`, `_download_data_osap`, `_download_data_risk_free`, `_download_data_stock_prices`) are no longer re-exported from the package root. Public access continues via the dispatcher `download_data(domain, dataset, ...)`. If you need a helper directly, import it from its defining module (e.g. `from tidyfinance.data_download import _download_data_wrds`).
+
+## v0.4.0 (2026-07-27)
+
+- **Polars backend returns WRDS date columns as `Date` (#66):** WRDS calendar-date columns (`datadate`, `trd_exctn_dt`, CCM link dates, FISD dates) are now cast to `polars.Date` instead of `polars.Datetime`, matching the R package.
+- **Added FRED-MD and FRED-QD macroeconomic databases:** `download_data("FRED", "FRED-MD" / "FRED-QD")` download the McCracken and Ng (2016, 2021) macro panels. `transform=True` applies each series' transform code; `vintage` enables point-in-time analysis.
+- **Added Global Factor Data, Pastor-Stambaugh, and Stambaugh-Yuan downloads:** `download_data("Global Factor Data")` downloads portfolios, industries, or cutoffs from Jensen, Kelly, and Pedersen (2023). `download_data("Pastor-Stambaugh")` and `download_data("Stambaugh-Yuan")` download the liquidity and mispricing factors.
+- **OSAP download aligned with beginning-of-month and scaled returns:** `download_data("Open Source Asset Pricing")` now uses beginning-of-month dates (was end-of-month) and decimal returns (divided by 100).
+- **`sorting_variable` is now optional for `factor_library`:** it returns the default construction for all sorting variables when omitted, and passing `None` for a filter column removes that filter.
+- **Added `detail` parameter to `estimate_fama_macbeth`:** `detail=True` returns coefficients plus summary statistics (mean `r_squared`, `adj_r_squared`, `n_obs`). Default unchanged.
+- **Dependencies (replaced pyfixest with formulaic):** dropped `pyfixest` for `formulaic`.
