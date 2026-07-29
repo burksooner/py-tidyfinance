@@ -1,32 +1,68 @@
 """Test script for tidyfinance package."""
 
+import datetime as dt
 import os
 import sys
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 )
 from tidyfinance.lagging import add_lagged_columns  # noqa: E402
-from tidyfinance.portfolios import breakpoint_options, compute_breakpoints  # noqa: E402
-from tidyfinance.regression import _newey_west_se, estimate_betas, estimate_fama_macbeth  # noqa: E402
+from tidyfinance.portfolios import (  # noqa: E402
+    breakpoint_options,
+    compute_breakpoints,
+)
+from tidyfinance.regression import (  # noqa: E402
+    _newey_west_se,
+    estimate_betas,
+    estimate_fama_macbeth,
+)
 from tidyfinance.utilities import create_summary_statistics  # noqa: E402
+
+
+def _month_starts(start: dt.date, periods: int) -> list[dt.date]:
+    out = []
+    year, month = start.year, start.month
+    for _ in range(periods):
+        out.append(dt.date(year, month, 1))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return out
+
+
+def _month_ends(start_year: int, start_month: int, periods: int):
+    import calendar
+
+    out = []
+    year, month = start_year, start_month
+    for _ in range(periods):
+        out.append(dt.date(year, month, calendar.monthrange(year, month)[1]))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return out
 
 
 # %% Helper function to create test data
 def create_test_data():
     np.random.seed(42)  # For reproducibility
-    dates = pd.date_range(start="2023-01-01", periods=10, freq="MS")
-    data = {
-        "permno": np.repeat([1, 2], 10),
-        "date": np.tile(dates, 2),
-        "bm": np.random.uniform(0.5, 1.5, 20),
-        "size": np.random.uniform(100, 200, 20),
-    }
-    return pd.DataFrame(data)
+    dates = _month_starts(dt.date(2023, 1, 1), 10)
+    return pl.DataFrame(
+        {
+            "permno": np.repeat([1, 2], 10),
+            "date": dates * 2,
+            "bm": np.random.uniform(0.5, 1.5, 20),
+            "size": np.random.uniform(100, 200, 20),
+        }
+    )
 
 
 # %% Tests
@@ -36,7 +72,7 @@ def test_add_lagged_columns():
     result = add_lagged_columns(
         data,
         cols=["bm", "size"],
-        lag=pd.DateOffset(months=3),
+        lag="3mo",
         by="permno",
     )
 
@@ -62,23 +98,18 @@ def test_invalid_max_lag():
         add_lagged_columns(
             data,
             cols=["bm", "size"],
-            lag=pd.DateOffset(months=3),
-            max_lag=pd.DateOffset(months=1),
+            lag="3mo",
+            max_lag="1mo",
         )
 
 
 def test_without_grouping():
     """Test function works without grouping"""
-    data = (
-        create_test_data()
-        .query("permno == 1")
-        .drop(columns="permno")
-        .reset_index(drop=True)
-    )
+    data = create_test_data().filter(pl.col("permno") == 1).drop("permno")
     result = add_lagged_columns(
         data,
         cols=["bm", "size"],
-        lag=pd.DateOffset(months=3),
+        lag="3mo",
     )
 
     assert "bm_lag" in result.columns
@@ -91,9 +122,8 @@ def test_preserve_original_values():
     data = create_test_data()
     result = add_lagged_columns(data, cols=["bm", "size"], lag=3, by="permno")
 
-    # Convert to lists for comparison
-    assert result.get("bm").to_list() == data.get("bm").to_list()
-    assert result.get("size").to_list() == data.get("size").to_list()
+    assert result["bm"].to_list() == data["bm"].to_list()
+    assert result["size"].to_list() == data["size"].to_list()
 
 
 def test_lag_values_correctness():
@@ -102,19 +132,19 @@ def test_lag_values_correctness():
     result = add_lagged_columns(
         data,
         cols=["bm"],
-        lag=pd.DateOffset(months=1),
+        lag="1mo",
         by="permno",
     )
 
     # For each permno group, check if lag values are correct
     for permno in [1, 2]:
-        group_data = result.query("permno == @permno").sort_values("date")
+        group_data = result.filter(pl.col("permno") == permno).sort("date")
         orig_values = group_data["bm"].to_list()
         lag_values = group_data["bm_lag"].to_list()
 
         # Lagged values equal originals shifted by 1 month
         assert lag_values[1:] == orig_values[:-1]
-        assert np.isnan(lag_values[0])  # First value has no source
+        assert lag_values[0] is None  # First value has no source
 
 
 def test_window_lag_produces_single_column():
@@ -123,8 +153,8 @@ def test_window_lag_produces_single_column():
     result = add_lagged_columns(
         data,
         cols=["bm"],
-        lag=pd.DateOffset(months=1),
-        max_lag=pd.DateOffset(months=3),
+        lag="1mo",
+        max_lag="3mo",
         by="permno",
     )
 
@@ -148,44 +178,43 @@ def test_invalid_date_column():
 
 
 @pytest.fixture
-def sample_data() -> pd.DataFrame:
+def sample_data() -> pl.DataFrame:
     np.random.seed(42)
-    dates = pd.date_range(start="2020-01-01", periods=100, freq="D")
+    dates = [dt.date(2020, 1, 1) + dt.timedelta(days=i) for i in range(100)]
     permnos = [1, 2]
-    data = pd.DataFrame(
+    return pl.DataFrame(
         {
-            "date": np.tile(dates, len(permnos)),
+            "date": dates * len(permnos),
             "permno": np.repeat(permnos, len(dates)),
             "ret_excess": np.random.randn(len(dates) * len(permnos)),
             "mkt_excess": np.random.randn(len(dates) * len(permnos)),
         }
     )
-    return data
 
 
-def test_estimate_rolling_betas_basic(sample_data: pd.DataFrame) -> None:
+def test_estimate_rolling_betas_basic(sample_data: pl.DataFrame) -> None:
     lookback = 30
     result = estimate_betas(sample_data, "ret_excess ~ mkt_excess", lookback)
-    assert not result.empty, "Result should not be empty"
+    assert not result.is_empty(), "Result should not be empty"
     assert "mkt_excess" in result.columns, (
         "Output should include beta estimate for mkt_excess"
     )
 
 
-def test_estimate_rolling_betas_min_obs(sample_data: pd.DataFrame) -> None:
+def test_estimate_rolling_betas_min_obs(sample_data: pl.DataFrame) -> None:
     lookback = 30
     min_obs = 10
     result = estimate_betas(
         sample_data, "ret_excess ~ mkt_excess", lookback, min_obs=min_obs
     )
-    assert result.shape[0] > 0, "Result should have valid estimates"
-    assert result["mkt_excess"].isna().sum() > 0, (
-        "Some estimates should be NaN due to min_obs constraint"
+    assert result.height > 0, "Result should have valid estimates"
+    assert result["mkt_excess"].is_null().sum() > 0, (
+        "Some estimates should be null due to min_obs constraint"
     )
 
 
 def test_estimate_betas_min_obs_non_positive_raises(
-    sample_data: pd.DataFrame,
+    sample_data: pl.DataFrame,
 ) -> None:
     """min_obs <= 0 raises a ValueError."""
     for bad in (0, -5):
@@ -196,7 +225,7 @@ def test_estimate_betas_min_obs_non_positive_raises(
 
 
 def test_estimate_betas_default_min_obs_is_80_percent(
-    sample_data: pd.DataFrame,
+    sample_data: pl.DataFrame,
 ) -> None:
     """min_obs defaults to 80% of lookback when not provided."""
     lookback = 30
@@ -207,11 +236,11 @@ def test_estimate_betas_default_min_obs_is_80_percent(
         lookback,
         min_obs=int(lookback * 0.8),
     )
-    pd.testing.assert_frame_equal(default, explicit)
+    assert_frame_equal(default, explicit)
 
 
 def test_estimate_betas_without_intercept_omits_intercept_column(
-    sample_data: pd.DataFrame,
+    sample_data: pl.DataFrame,
 ) -> None:
     """A '- 1' formula omits the Intercept column."""
     result = estimate_betas(sample_data, "ret_excess ~ mkt_excess - 1", 30)
@@ -220,39 +249,37 @@ def test_estimate_betas_without_intercept_omits_intercept_column(
 
 
 def test_estimate_betas_match_per_window_ols(
-    sample_data: pd.DataFrame,
+    sample_data: pl.DataFrame,
 ) -> None:
     """Estimated betas match a per-window OLS fit."""
     lookback = 30
     result = estimate_betas(sample_data, "ret_excess ~ mkt_excess", lookback)
 
-    group = (
-        sample_data[sample_data["permno"] == 1]
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    group = sample_data.filter(pl.col("permno") == 1).sort("date")
     i = 50
-    window = group.iloc[i - lookback + 1 : i + 1]
+    window = group.slice(i - lookback + 1, lookback)
     design = np.column_stack(
-        [np.ones(len(window)), window["mkt_excess"].values]
+        [np.ones(window.height), window["mkt_excess"].to_numpy()]
     )
-    expected = np.linalg.lstsq(design, window["ret_excess"].values, rcond=None)[
-        0
-    ]
+    expected = np.linalg.lstsq(
+        design, window["ret_excess"].to_numpy(), rcond=None
+    )[0]
 
-    row = result[
-        (result["permno"] == 1) & (result["date"] == group.loc[i, "date"])
-    ]
+    row = result.filter(
+        (pl.col("permno") == 1) & (pl.col("date") == group["date"][i])
+    )
     np.testing.assert_allclose(
-        row[["Intercept", "mkt_excess"]].values[0], expected, rtol=1e-8
+        row.select(["Intercept", "mkt_excess"]).to_numpy()[0],
+        expected,
+        rtol=1e-8,
     )
 
 
 def test_estimate_betas_custom_id_column(
-    sample_data: pd.DataFrame,
+    sample_data: pl.DataFrame,
 ) -> None:
     """A non-default stock identifier column is honored."""
-    renamed = sample_data.rename(columns={"permno": "gvkey"})
+    renamed = sample_data.rename({"permno": "gvkey"})
     result = estimate_betas(
         renamed, "ret_excess ~ mkt_excess", 30, id_col="gvkey"
     )
@@ -261,41 +288,40 @@ def test_estimate_betas_custom_id_column(
 
 
 def test_estimate_betas_invalid_formula_raises(
-    sample_data: pd.DataFrame,
+    sample_data: pl.DataFrame,
 ) -> None:
     """A formula without '~' raises a ValueError."""
     with pytest.raises(ValueError, match="must contain '~'"):
         estimate_betas(sample_data, "ret_excess mkt_excess", 30)
 
 
-def sample_data_fmb() -> pd.DataFrame:
+def sample_data_fmb() -> pl.DataFrame:
     np.random.seed(42)
-    dates = pd.date_range(start="2020-01-01", periods=12, freq="ME")
+    dates = _month_ends(2020, 1, 12)
     permnos = range(50)
-    data = pd.DataFrame(
+    return pl.DataFrame(
         {
-            "date": np.tile(dates, len(permnos)),
-            "permno": np.repeat(permnos, len(dates)),
+            "date": dates * len(permnos),
+            "permno": np.repeat(list(permnos), len(dates)),
             "ret_excess": np.random.randn(len(dates) * len(permnos)),
             "beta": np.random.randn(len(dates) * len(permnos)),
             "bm": np.random.randn(len(dates) * len(permnos)),
             "log_mktcap": np.random.randn(len(dates) * len(permnos)),
         }
     )
-    return data
 
 
-def test_estimate_fama_macbeth_basic(sample_data: pd.DataFrame) -> None:
+def test_estimate_fama_macbeth_basic(sample_data: pl.DataFrame) -> None:
     result = estimate_fama_macbeth(
         sample_data_fmb(), "ret_excess ~ beta + bm + log_mktcap"
     )
-    assert not result.empty, "Result should not be empty"
+    assert not result.is_empty(), "Result should not be empty"
     assert "risk_premium" in result.columns, (
         "Output should include risk premia estimates"
     )
 
 
-def test_estimate_fama_macbeth_vcov(sample_data: pd.DataFrame) -> None:
+def test_estimate_fama_macbeth_vcov(sample_data: pl.DataFrame) -> None:
     result = estimate_fama_macbeth(
         sample_data_fmb(), "ret_excess ~ beta + bm + log_mktcap", vcov="iid"
     )
@@ -316,7 +342,7 @@ def test_estimate_fama_macbeth_invalid_vcov_raises() -> None:
 
 def test_estimate_fama_macbeth_missing_date_column_raises() -> None:
     """A missing date column raises a ValueError."""
-    data = sample_data_fmb().drop(columns="date")
+    data = sample_data_fmb().drop("date")
     with pytest.raises(ValueError, match="must contain a date column"):
         estimate_fama_macbeth(data, "ret_excess ~ beta + bm + log_mktcap")
 
@@ -325,7 +351,7 @@ def test_estimate_fama_macbeth_n_equals_number_of_periods() -> None:
     """The reported 'n' equals the number of distinct periods."""
     data = sample_data_fmb()
     result = estimate_fama_macbeth(data, "ret_excess ~ beta + bm + log_mktcap")
-    assert (result["n"] == data["date"].nunique()).all()
+    assert (result["n"] == data["date"].n_unique()).all()
 
 
 def test_estimate_fama_macbeth_detail() -> None:
@@ -343,7 +369,7 @@ def test_estimate_fama_macbeth_detail() -> None:
         "n_obs",
     ]
     assert len(summary_statistics) == 1
-    assert 0 <= summary_statistics["r_squared"].iloc[0] <= 1
+    assert 0 <= summary_statistics["r_squared"][0] <= 1
 
 
 # Fixed series with reference values computed in R via
@@ -403,11 +429,11 @@ def test_newey_west_se_legacy_path_equals_statsmodels_hac() -> None:
     assert se == pytest.approx(0.0012883225527793873, rel=1e-9)
 
 
-def _sample_data_fmb_parity() -> pd.DataFrame:
+def _sample_data_fmb_parity() -> pl.DataFrame:
     """Deterministic panel; reference values produced by r-tidyfinance's
     estimate_fama_macbeth (vcov='newey-west') on the identical data."""
     rng = np.random.default_rng(987654)
-    dates = pd.date_range("2000-01-31", periods=48, freq="ME")
+    dates = _month_ends(2000, 1, 48)
     recs = []
     for d in dates:
         beta = rng.normal(1, 0.3, size=40)
@@ -417,8 +443,10 @@ def _sample_data_fmb_parity() -> pd.DataFrame:
         ret = 0.002 + 0.0015 * beta - 0.003 * bm + 0.0008 * size + eps
         for p in range(40):
             recs.append((d, p, ret[p], beta[p], bm[p], size[p]))
-    return pd.DataFrame(
-        recs, columns=["date", "permno", "ret_excess", "beta", "bm", "size"]
+    return pl.DataFrame(
+        recs,
+        schema=["date", "permno", "ret_excess", "beta", "bm", "size"],
+        orient="row",
     )
 
 
@@ -431,8 +459,8 @@ def test_estimate_fama_macbeth_newey_west_matches_r() -> None:
     out = estimate_fama_macbeth(
         _sample_data_fmb_parity(), "ret_excess ~ beta + bm + size"
     )
-    t = out.set_index("factor")["t_statistic"].to_dict()
-    rp = out.set_index("factor")["risk_premium"].to_dict()
+    t = dict(zip(out["factor"].to_list(), out["t_statistic"].to_list()))
+    rp = dict(zip(out["factor"].to_list(), out["risk_premium"].to_list()))
     # Reference values are rounded to 3 decimals, so compare within half a
     # unit in the last place (abs=5e-4).
     assert t["Intercept"] == pytest.approx(-0.792, abs=5e-4)
@@ -456,12 +484,12 @@ def test_estimate_fama_macbeth_maxlags_deprecated() -> None:
         "ret_excess ~ beta + bm + log_mktcap",
         vcov_options={"lag": 6, "prewhite": 0},
     )
-    pd.testing.assert_frame_equal(legacy, explicit)
+    assert_frame_equal(legacy, explicit)
 
 
-def sample_data_summary() -> pd.DataFrame:
+def sample_data_summary() -> pl.DataFrame:
     np.random.seed(42)
-    data = pd.DataFrame(
+    return pl.DataFrame(
         {
             "group": np.random.choice(["A", "B"], size=100),
             "x": np.random.randn(100),
@@ -469,12 +497,11 @@ def sample_data_summary() -> pd.DataFrame:
             "z": np.random.randint(0, 100, size=100),
         }
     )
-    return data
 
 
 def test_create_summary_statistics_basic(sample_data) -> None:
     result = create_summary_statistics(sample_data_summary(), ["x", "y"])
-    assert not result.empty, "Result should not be empty"
+    assert not result.is_empty(), "Result should not be empty"
     assert "mean" in result.columns, "Output should include mean calculation"
 
 
@@ -483,65 +510,64 @@ def test_create_summary_statistics_by_group(sample_data) -> None:
         sample_data_summary(), ["x", "y"], by="group"
     )
     assert "group" in result.columns, "Output should include group column"
-    assert "mean" in result.columns.get_level_values(1), (
-        "Output should include mean calculation"
-    )
+    assert "mean" in result.columns, "Output should include mean calculation"
+    # One row per (group, variable) combination in tidy long format.
+    assert result.height == 4
 
 
 def test_create_summary_statistics_detail(sample_data) -> None:
     result = create_summary_statistics(
         sample_data_summary(), ["x", "y"], detail=True
     )
-    assert "1%" in result.columns, (
+    assert "q01" in result.columns, (
         "Detailed statistics should include 1st percentile"
     )
-    assert "99%" in result.columns, (
+    assert "q99" in result.columns, (
         "Detailed statistics should include 99th percentile"
     )
 
 
 def test_create_summary_statistics_accepts_boolean() -> None:
     """Test boolean columns are summarized as proportion of True."""
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
             "flag": [True, False, True, True],
             "x": [1.0, 2.0, 3.0, 4.0],
         }
     )
     result = create_summary_statistics(df, ["flag", "x"])
-    flag_row = result[result["variable"] == "flag"].iloc[0]
-    assert abs(flag_row["mean"] - 0.75) < 1e-12, (
+    flag_mean = result.filter(pl.col("variable") == "flag")["mean"][0]
+    assert abs(flag_mean - 0.75) < 1e-12, (
         "Boolean mean should equal the proportion of True"
     )
 
 
 def test_create_summary_statistics_rejects_strings() -> None:
-    """Test object dtype columns raise ValueError."""
-    df = pd.DataFrame({"name": ["A", "B", "C"], "x": [1, 2, 3]})
+    """Test string dtype columns raise ValueError."""
+    df = pl.DataFrame({"name": ["A", "B", "C"], "x": [1, 2, 3]})
     with pytest.raises(ValueError, match="not numeric or boolean"):
         create_summary_statistics(df, ["name", "x"])
 
 
 def test_create_summary_statistics_handles_na() -> None:
     """NA values are dropped before statistics are computed."""
-    df = pd.DataFrame({"x": [1.0, 2.0, np.nan, 4.0]})
+    df = pl.DataFrame({"x": [1.0, 2.0, None, 4.0]})
     result = create_summary_statistics(df, ["x"])
-    assert result["count"].iloc[0] == 3
-    assert result["mean"].iloc[0] == pytest.approx((1.0 + 2.0 + 4.0) / 3)
+    assert result["n"][0] == 3
+    assert result["mean"][0] == pytest.approx((1.0 + 2.0 + 4.0) / 3)
 
 
-def sample_data_ls() -> pd.DataFrame:
+def sample_data_ls() -> pl.DataFrame:
     np.random.seed(42)
-    dates = pd.date_range(start="2020-01-01", periods=10, freq="ME")
+    dates = _month_ends(2020, 1, 10)
     portfolios = [1, 2]
-    data = pd.DataFrame(
+    return pl.DataFrame(
         {
-            "date": np.tile(dates, len(portfolios)),
+            "date": dates * len(portfolios),
             "portfolio": np.repeat(portfolios, len(dates)),
             "ret_excess": np.random.randn(len(dates) * len(portfolios)),
         }
     )
-    return data
 
 
 def test_breakpoint_options_default():
@@ -570,9 +596,9 @@ def test_breakpoint_options_invalid():
         breakpoint_options(percentiles=[-0.1, 1.2])  # Invalid percentiles
 
 
-def sample_data_breakpoints() -> pd.DataFrame:
+def sample_data_breakpoints() -> pl.DataFrame:
     np.random.seed(42)
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "id": np.arange(1, 101),
             "exchange": np.random.choice(["NYSE", "NASDAQ"], 100),

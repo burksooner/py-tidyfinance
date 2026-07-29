@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 from typing import Optional
 
-import pandas as pd
+import polars as pl
 
 __all__ = ["list_supported_datasets"]
 
@@ -2119,11 +2119,11 @@ _OTHER_DATASETS = [
 def list_supported_datasets(
     domain: Optional[str | list[str]] = None,
     as_vector: bool = False,
-) -> "pd.DataFrame | list[str]":
+) -> "pl.DataFrame | list[str]":
     """List all datasets supported by 'download_data'.
 
     Aggregates the Global Q, Fama-French, Goyal-Welch, WRDS, Pseudo Data,
-    and "other" tables into a single :class:'pandas.DataFrame'. The legacy
+    and "other" tables into a single :class:'polars.DataFrame'. The legacy
     Fama-French table is intentionally excluded from the master listing.
 
     Parameters
@@ -2137,7 +2137,7 @@ def list_supported_datasets(
 
     Returns
     -------
-    pandas.DataFrame or list of str
+    polars.DataFrame or list of str
         Either a DataFrame with columns 'type', 'dataset_name', and
         'domain', or a list of 'type' strings when 'as_vector=True'.
 
@@ -2158,18 +2158,20 @@ def list_supported_datasets(
         + _PSEUDO_DATASETS
         + _OTHER_DATASETS
     )
-    df = pd.DataFrame(rows)[["type", "dataset_name", "domain"]]
+    df = pl.from_dicts(rows, infer_schema_length=None).select(
+        ["type", "dataset_name", "domain"]
+    )
 
     if domain is not None:
         if isinstance(domain, str):
             filter_domains = [domain]
         else:
             filter_domains = list(domain)
-        df = df[df["domain"].isin(filter_domains)].reset_index(drop=True)
+        df = df.filter(pl.col("domain").is_in(filter_domains))
 
     if as_vector:
-        return df["type"].tolist()
-    return df.reset_index(drop=True)
+        return df["type"].to_list()
+    return df
 
 
 # %% Legacy-type translation helpers

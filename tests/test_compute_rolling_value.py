@@ -1,10 +1,11 @@
 """Tests for compute_rolling_value."""
 
+import datetime as dt
 import os
 import sys
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -14,11 +15,22 @@ sys.path.insert(
 from tidyfinance.lagging import compute_rolling_value  # noqa: E402
 
 
+def month_starts(n_months, start_year=2020):
+    """Return n_months monthly first-of-month dates starting Jan-start."""
+    return [
+        dt.date(start_year + i // 12, i % 12 + 1, 1) for i in range(n_months)
+    ]
+
+
 def make_df(n_months=24, seed=42):
     """Construct a monthly panel for tests."""
     rng = np.random.default_rng(seed)
-    dates = pd.date_range("2020-01-01", periods=n_months, freq="MS")
-    return pd.DataFrame({"date": dates, "value": rng.standard_normal(n_months)})
+    return pl.DataFrame(
+        {
+            "date": month_starts(n_months),
+            "value": rng.standard_normal(n_months),
+        }
+    )
 
 
 # %% validation tests
@@ -26,14 +38,14 @@ def make_df(n_months=24, seed=42):
 
 def test_errors_when_data_has_no_date_column():
     """Test errors when data has no date column."""
-    df = pd.DataFrame({"value": [1.0, 2.0, 3.0]})
+    df = pl.DataFrame({"value": [1.0, 2.0, 3.0]})
     with pytest.raises(ValueError, match="date"):
         compute_rolling_value(df, lambda x: x["value"].mean())
 
 
 def test_errors_when_date_column_is_not_date_class():
-    """Test errors when date column is not datetime dtype."""
-    df = pd.DataFrame(
+    """Test errors when date column is not a date/datetime dtype."""
+    df = pl.DataFrame(
         {"date": ["2020-01-01", "2020-02-01"], "value": [1.0, 2.0]}
     )
     with pytest.raises(ValueError, match="datetime"):
@@ -100,29 +112,39 @@ def test_min_obs_larger_than_periods_makes_more_windows_nan():
     assert np.isnan(out).all()
 
 
-# %% NaN handling
+# %% missing-value handling
 
 
 def test_rows_with_na_values_are_dropped_before_applying_f():
-    """Test rows with NaN values are dropped before applying f."""
+    """Test rows with missing values are dropped before applying f."""
     df = make_df(n_months=6)
-    df.loc[2, "value"] = np.nan
+    df = df.with_columns(
+        pl.when(pl.int_range(pl.len()) == 2)
+        .then(None)
+        .otherwise(pl.col("value"))
+        .alias("value")
+    )
     out = compute_rolling_value(
         df, lambda x: len(x), period="month", periods=4, min_obs=1
     )
-    # At i=2, the window contains 3 rows (0, 1, 2), but row 2 has NaN
-    # -> dropna gives 2 rows -> f returns 2
+    # At i=2, the window contains 3 rows (0, 1, 2), but row 2 is missing
+    # -> complete cases give 2 rows -> f returns 2
     assert out[2] == 2
 
 
 def test_window_returns_nan_when_complete_cases_less_than_min_obs_due_to_nas():
-    """Test window returns NaN when complete cases < min_obs due to NaNs."""
+    """Test window returns NaN when complete cases < min_obs."""
     df = make_df(n_months=6)
-    df.loc[:2, "value"] = np.nan  # First 3 values are NaN
+    df = df.with_columns(
+        pl.when(pl.int_range(pl.len()) < 3)
+        .then(None)
+        .otherwise(pl.col("value"))
+        .alias("value")
+    )  # First 3 values are missing
     out = compute_rolling_value(
         df, lambda x: x["value"].mean(), period="month", periods=4, min_obs=3
     )
-    # At i=2: window has 3 rows but all NaN -> dropna gives 0 -> NaN
+    # At i=2: window has 3 rows but all missing -> 0 complete cases -> NaN
     assert np.isnan(out[2])
 
 
@@ -135,7 +157,7 @@ def test_rolling_mean_with_periods_1_equals_original_values():
     out = compute_rolling_value(
         df, lambda x: x["value"].mean(), period="month", periods=1
     )
-    np.testing.assert_allclose(out, df["value"].values)
+    np.testing.assert_allclose(out, df["value"].to_numpy())
 
 
 def test_rolling_mean_with_periods_3_computes_correct_values():
@@ -144,7 +166,7 @@ def test_rolling_mean_with_periods_3_computes_correct_values():
     out = compute_rolling_value(
         df, lambda x: x["value"].mean(), period="month", periods=3
     )
-    expected_at_5 = df["value"].iloc[3:6].mean()
+    expected_at_5 = df["value"].slice(3, 3).mean()
     assert abs(out[5] - expected_at_5) < 1e-12
 
 
@@ -154,7 +176,7 @@ def test_rolling_sum_works_correctly():
     out = compute_rolling_value(
         df, lambda x: x["value"].sum(), period="month", periods=3
     )
-    expected_at_5 = df["value"].iloc[3:6].sum()
+    expected_at_5 = df["value"].slice(3, 3).sum()
     assert abs(out[5] - expected_at_5) < 1e-12
 
 
@@ -164,7 +186,7 @@ def test_rolling_sd_works_correctly():
     out = compute_rolling_value(
         df, lambda x: x["value"].std(), period="month", periods=4
     )
-    expected_at_5 = df["value"].iloc[2:6].std()
+    expected_at_5 = df["value"].slice(2, 4).std()
     assert abs(out[5] - expected_at_5) < 1e-12
 
 
@@ -220,9 +242,9 @@ def test_works_with_period_year():
 def test_works_with_multiple_columns():
     """Test works with multiple columns (e.g., regression residuals)."""
     rng = np.random.default_rng(42)
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
-            "date": pd.date_range("2020-01-01", periods=12, freq="MS"),
+            "date": month_starts(12),
             "y": rng.standard_normal(12),
             "x": rng.standard_normal(12),
         }
@@ -238,9 +260,9 @@ def test_works_with_multiple_columns():
 
 def test_single_row_data_frame_works():
     """Test single-row data frame works."""
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
-            "date": pd.date_range("2020-01-01", periods=1, freq="MS"),
+            "date": [dt.date(2020, 1, 1)],
             "value": [1.0],
         }
     )
@@ -252,9 +274,9 @@ def test_single_row_data_frame_works():
 
 def test_single_row_data_frame_returns_nan_when_min_obs_gt_1():
     """Test single-row data frame returns NaN when min_obs > 1."""
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
-            "date": pd.date_range("2020-01-01", periods=1, freq="MS"),
+            "date": [dt.date(2020, 1, 1)],
             "value": [1.0],
         }
     )
@@ -269,9 +291,9 @@ def test_single_row_data_frame_returns_nan_when_min_obs_gt_1():
 
 
 def test_all_na_value_column_returns_all_nans():
-    """Test all-NaN value column returns all NaNs."""
+    """Test all-missing value column returns all NaNs."""
     df = make_df(n_months=6)
-    df["value"] = np.nan
+    df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("value"))
     out = compute_rolling_value(
         df, lambda x: x["value"].mean(), period="month", periods=3
     )
@@ -293,9 +315,9 @@ def test_periods_equal_to_nrow_uses_full_history_for_last_row():
 
 def test_data_options_with_non_default_date_column_works():
     """Test data_options with non-default date column works."""
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
-            "my_date": pd.date_range("2020-01-01", periods=6, freq="MS"),
+            "my_date": month_starts(6),
             "value": np.arange(6, dtype=float),
         }
     )
@@ -313,7 +335,7 @@ def test_data_options_with_non_default_date_column_works():
 def test_non_default_date_column_produces_same_results_as_default():
     """Test non-default date column produces same results as default."""
     df_default = make_df(n_months=6)
-    df_custom = df_default.rename(columns={"date": "my_date"})
+    df_custom = df_default.rename({"date": "my_date"})
     out_default = compute_rolling_value(
         df_default, lambda x: x["value"].mean(), period="month", periods=3
     )
@@ -342,8 +364,8 @@ def test_errors_when_mapped_date_column_is_absent_from_data():
 
 
 def test_errors_when_mapped_date_column_is_not_date():
-    """Test errors when mapped date column is not datetime dtype."""
-    df = pd.DataFrame(
+    """Test errors when mapped date column is not a date/datetime dtype."""
+    df = pl.DataFrame(
         {"my_date": ["2020-01-01", "2020-02-01"], "value": [1.0, 2.0]}
     )
     with pytest.raises(ValueError, match="datetime"):

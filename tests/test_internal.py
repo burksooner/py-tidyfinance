@@ -4,7 +4,7 @@ import os
 import sys
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 from dotenv import dotenv_values
 
@@ -127,7 +127,7 @@ def test_trim_edge_cases():
 def test_list_supported_indexes():
     """Test that the function returns a DataFrame with the expected columns."""
     df = list_supported_indexes()
-    assert isinstance(df, pd.DataFrame)
+    assert isinstance(df, pl.DataFrame)
     assert "index" in df.columns
     assert "url" in df.columns
     assert "skip" in df.columns

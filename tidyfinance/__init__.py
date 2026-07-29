@@ -64,10 +64,10 @@ if "__path__" in globals():
 
 # Wrap the public, data-bearing API at the boundary so it honors the
 # active backend (see tidyfinance.set_backend). The wrapped functions
-# accept polars or pandas input and return the active backend's data
+# accept pandas or polars input and return the active backend's data
 # frame type. Internal calls between core functions are left untouched,
-# since they reference the original (undecorated) functions in their
-# defining modules.
+# since they reference the original (undecorated) polars-native
+# functions in their defining modules.
 from .backend import _use_backend  # noqa: E402
 
 _BACKEND_WRAPPED = (

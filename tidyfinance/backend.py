@@ -1,11 +1,13 @@
 """Global data frame backend for tidyfinance.
 
-The backend controls the type of data frame returned by the public
-tidyfinance API. The default is 'pandas'; after
-'set_backend("polars")' the functions return 'polars.DataFrame'
-objects instead. Polars data frames are also accepted as input
-regardless of the active backend (they are converted to pandas
-internally), so results from one call can be fed straight into the next.
+The package is implemented in polars. The backend controls the type of
+data frame returned by the public tidyfinance API. The default is
+'pandas' for backward compatibility; after 'set_backend("polars")' the
+functions return the internal 'polars.DataFrame' objects directly with
+zero conversion overhead. Pandas data frames are accepted as input
+regardless of the active backend (they are converted to polars
+internally), so results from one call can be fed straight into the
+next.
 
 Examples
 --------
@@ -20,18 +22,17 @@ tf.set_backend("pandas")  # back to the default
 
 import functools
 
+import polars as pl
+
 _VALID_BACKENDS = ("pandas", "polars")
 
 _BACKEND = "pandas"
 
 # Calendar-date columns handled by the download functions. Internally
-# pandas stores them as datetime64 (there is no plain date dtype), so
-# they would surface as 'polars.Datetime' under the polars backend.
-# '_convert_output' casts them to 'polars.Date' so they match the R
-# package and can be joined or stacked against 'Date'-typed frames.
-# Some names ('rdq', 'trd_rpt_dt', 'stlmnt_dt') are dropped before the
-# downloads return and are listed defensively for raw frames that
-# users pass through the analytics functions.
+# polars stores them as 'polars.Date'. Pandas inputs carry them as
+# datetime64 (pandas has no plain date dtype), so '_to_polars_input'
+# casts tz-naive datetime columns with these names to 'polars.Date' on
+# entry so they match the internal representation and the R package.
 _DATE_COLUMNS = frozenset(
     {
         # all download functions
@@ -70,24 +71,23 @@ def set_backend(backend: str) -> None:
     ValueError
         If 'backend' is not a recognized value.
     ImportError
-        If 'backend' is 'polars' but the optional 'polars' package is
-        not installed.
+        If 'backend' is 'pandas' but the 'pandas' package is not
+        installed.
 
     Notes
     -----
-    The polars backend wraps the public API at the package boundary:
-    polars inputs are converted to pandas before each call, and pandas
-    outputs are converted to polars on return. Chained calls therefore
-    round-trip through pandas on every step, which adds a measurable
-    cost on large panels. The pandas backend is a pass-through with
-    zero conversion overhead.
+    The package computes in polars internally. The pandas backend wraps
+    the public API at the package boundary: pandas inputs are converted
+    to polars before each call, and polars outputs are converted to
+    pandas on return. The polars backend is a pass-through with zero
+    conversion overhead.
 
-    On conversion to polars, known calendar-date columns (e.g. 'date',
-    'datadate', 'trd_exctn_dt') are cast from 'polars.Datetime' to
-    'polars.Date', since pandas has no plain date dtype and would
-    otherwise surface them as datetimes. Any time-of-day component in
-    a column with one of these names is therefore dropped on output.
-    Timezone-aware datetime columns are never cast.
+    On conversion from pandas, known calendar-date columns (e.g.
+    'date', 'datadate', 'trd_exctn_dt') are cast from
+    'polars.Datetime' to 'polars.Date', since pandas has no plain date
+    dtype. Any time-of-day component in a column with one of these
+    names is therefore dropped on input. Timezone-aware datetime
+    columns are never cast.
     """
     global _BACKEND
     if backend not in _VALID_BACKENDS:
@@ -95,14 +95,12 @@ def set_backend(backend: str) -> None:
             f"Invalid backend '{backend}'. Valid backends: "
             f"{', '.join(_VALID_BACKENDS)}."
         )
-    if backend == "polars":
+    if backend == "pandas":
         try:
-            import polars  # noqa: F401
+            import pandas  # noqa: F401
         except ImportError as e:
             raise ImportError(
-                "The 'polars' backend requires the optional 'polars' "
-                "package. Install it via "
-                "'pip install tidyfinance[polars]'."
+                "The 'pandas' backend requires the 'pandas' package."
             ) from e
     _BACKEND = backend
 
@@ -112,84 +110,115 @@ def get_backend() -> str:
     return _BACKEND
 
 
-def _is_polars_obj(obj) -> bool:
-    """Return True for polars DataFrame/LazyFrame/Series without
-    importing polars (so the check is cheap when polars is absent)."""
+def _is_pandas_obj(obj) -> bool:
+    """Return True for pandas DataFrame/Series without importing pandas
+    (so the check is cheap when pandas is absent)."""
     module = type(obj).__module__ or ""
-    return module.split(".")[0] == "polars" and type(obj).__name__ in (
+    return module.split(".")[0] == "pandas" and type(obj).__name__ in (
         "DataFrame",
-        "LazyFrame",
         "Series",
     )
 
 
-def _to_pandas_input(obj):
-    """Convert a polars input to pandas, leaving anything else as-is."""
-    if _is_polars_obj(obj):
-        if type(obj).__name__ == "LazyFrame":
-            obj = obj.collect()
-        return obj.to_pandas()
+def _cast_date_columns(frame: pl.DataFrame) -> pl.DataFrame:
+    """Cast known tz-naive datetime calendar-date columns to pl.Date."""
+    date_casts = [
+        pl.col(name).cast(pl.Date)
+        for name in frame.columns
+        if name in _DATE_COLUMNS
+        and isinstance(frame.schema[name], pl.Datetime)
+        # never cast timezone-aware datetimes: casting would take the
+        # UTC calendar date, which can differ from the wall-clock date
+        and frame.schema[name].time_zone is None
+    ]
+    if date_casts:
+        frame = frame.with_columns(date_casts)
+    return frame
+
+
+def _to_polars_input(obj):
+    """Convert a pandas input to polars, leaving anything else as-is.
+
+    Pandas data frames are converted via 'polars.from_pandas'. A
+    non-default index (a named index or a non-'RangeIndex', such as a
+    date index) is preserved as a column, since polars has no concept
+    of an index. Known calendar-date columns ('_DATE_COLUMNS') that
+    arrive as tz-naive datetimes are cast to 'polars.Date' so they
+    match the internal representation. Lazy frames are collected.
+    """
+    if isinstance(obj, pl.LazyFrame):
+        return obj.collect()
+    if _is_pandas_obj(obj):
+        if type(obj).__name__ == "Series":
+            return pl.from_pandas(obj)
+        import pandas as pd
+
+        include_index = not (
+            isinstance(obj.index, pd.RangeIndex) and obj.index.name is None
+        )
+        out = pl.from_pandas(obj, include_index=include_index)
+        return _cast_date_columns(out)
     return obj
 
 
 def _convert_output(obj):
-    """Convert a pandas data frame to the active backend.
+    """Convert a polars object to the active backend.
 
-    With the '"pandas"' backend (or for anything that is not a pandas
-    data frame, e.g. a Series, dict, or ndarray) the object is returned
-    unchanged. With the '"polars"' backend, a pandas data frame is
-    converted via :func:'polars.from_pandas'. A non-default index (a
-    named index or a non-'RangeIndex', such as a date index) is
-    preserved as a column, since polars has no concept of an index.
-    Known calendar-date columns ('_DATE_COLUMNS', e.g. 'date',
-    'datadate', 'trd_exctn_dt') are cast from 'polars.Datetime' to
-    'polars.Date' so they print as 'YYYY-MM-DD' and join or stack
-    cleanly against 'Date'-typed frames. Other datetime columns pass
-    through unchanged.
+    With the '"polars"' backend the object is returned unchanged. With
+    the '"pandas"' backend, a 'polars.DataFrame' or 'polars.Series' is
+    converted via '.to_pandas()'; tz-naive datetime-like columns are
+    normalized to 'datetime64[ns]' so the output matches classic
+    pandas conventions. Dict values are converted recursively (e.g.
+    'estimate_model' with multiple outputs). Anything else (arrays,
+    lists, scalars) passes through unchanged.
     """
-    if get_backend() != "polars":
+    if get_backend() != "pandas":
         return obj
 
-    import pandas as pd
+    if isinstance(obj, dict):
+        return {k: _convert_output(v) for k, v in obj.items()}
 
-    if not isinstance(obj, pd.DataFrame):
-        return obj
+    if isinstance(obj, pl.DataFrame):
+        out = obj.to_pandas()
+        for name in out.columns:
+            dtype = out[name].dtype
+            if (
+                str(dtype).startswith("datetime64")
+                and getattr(dtype, "tz", None) is None
+                and str(dtype) != "datetime64[ns]"
+            ):
+                out[name] = out[name].astype("datetime64[ns]")
+        return out
 
-    import polars as pl
+    if isinstance(obj, pl.Series):
+        out = obj.to_pandas()
+        dtype = out.dtype
+        if (
+            str(dtype).startswith("datetime64")
+            and getattr(dtype, "tz", None) is None
+            and str(dtype) != "datetime64[ns]"
+        ):
+            out = out.astype("datetime64[ns]")
+        return out
 
-    include_index = not (
-        isinstance(obj.index, pd.RangeIndex) and obj.index.name is None
-    )
-    out = pl.from_pandas(obj, include_index=include_index)
-    date_casts = [
-        pl.col(name).cast(pl.Date)
-        for name in out.columns
-        if name in _DATE_COLUMNS
-        and out.schema[name] == pl.Datetime
-        # never cast timezone-aware datetimes: casting would take the
-        # UTC calendar date, which can differ from the wall-clock date
-        and out.schema[name].time_zone is None
-    ]
-    if date_casts:
-        out = out.with_columns(date_casts)
-    return out
+    return obj
 
 
 def _use_backend(func):
     """Wrap a public function so it honors the active backend.
 
-    Polars data frames passed as arguments are converted to pandas
-    before the call; a pandas data frame returned by the call is
-    converted to the active backend afterwards. Non-data-frame
-    arguments and return values pass through untouched. Apply this at
-    the public API boundary only, so that internal calls between
-    functions keep operating on pandas.
+    Pandas data frames passed as arguments are converted to polars
+    before the call; polars objects returned by the call are converted
+    to the active backend afterwards. Non-data-frame arguments and
+    return values pass through untouched. Apply this at the public API
+    boundary only, so that internal calls between functions keep
+    operating on polars.
     """
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        args = tuple(_to_pandas_input(a) for a in args)
-        kwargs = {k: _to_pandas_input(v) for k, v in kwargs.items()}
+        args = tuple(_to_polars_input(a) for a in args)
+        kwargs = {k: _to_polars_input(v) for k, v in kwargs.items()}
         return _convert_output(func(*args, **kwargs))
 
     return wrapper

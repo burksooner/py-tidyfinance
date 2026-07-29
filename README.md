@@ -23,15 +23,13 @@ You can install the development version from GitHub:
 pip install "git+https://github.com/tidy-finance/py-tidyfinance"
 ```
 
-To use the optional [polars](https://pola.rs/) backend (see below), install the `polars` extra:
-
-```
-pip install "tidyfinance[polars]"
-```
-
 ## Choosing a Data Frame Backend
 
-By default, the public `tidyfinance` API returns [pandas](https://pandas.pydata.org/) data frames. If you prefer [polars](https://pola.rs/), switch the global backend with `set_backend()`:
+The package is implemented in [polars](https://pola.rs/) internally. By
+default, the public `tidyfinance` API still returns
+[pandas](https://pandas.pydata.org/) data frames for backward
+compatibility. If you prefer polars — as used throughout the book —
+switch the global backend with `set_backend()`:
 
 ```python
 import tidyfinance as tf
@@ -51,7 +49,7 @@ tf.estimate_model(data, "mkt_excess ~ smb + hml")
 tf.set_backend("pandas")  # back to the default
 ```
 
-The setting applies to the whole public API, so any data-bearing function honors it. Polars data frames are also accepted as input regardless of the active backend (they are converted to pandas internally), so results from one call can be fed straight into the next. You can check the current setting with `tf.get_backend()`.
+The setting applies to the whole public API, so any data-bearing function honors it. Pandas data frames are also accepted as input regardless of the active backend (they are converted to polars internally), so results from one call can be fed straight into the next. Under the `polars` backend there is no conversion overhead at all, since polars is the native representation. You can check the current setting with `tf.get_backend()`.
 
 > **Note:** The default backend is currently `pandas`, but we expect to switch the default to `polars` from version 1.0.0 onwards. To keep your code working across that change, set the backend explicitly via `tf.set_backend(...)`.
 

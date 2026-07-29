@@ -1,48 +1,62 @@
 """Internal utility functions for tidyfinance."""
 
-import numpy as np
-import pandas as pd
+import calendar
+import datetime as dt
 import re
 
+import numpy as np
+import polars as pl
 
-def _parse_date(d: str, is_end: bool = False) -> pd.Timestamp:
+
+def _shift_years(d: dt.date, years: int) -> dt.date:
+    """Shift a date by whole years, clamping Feb 29 to Feb 28."""
+    year = d.year + years
+    day = min(d.day, calendar.monthrange(year, d.month)[1])
+    return dt.date(year, d.month, day)
+
+
+def _parse_date(d, is_end: bool = False) -> dt.date | None:
     """
-    Parse a date-like string into a normalized 'pd.Timestamp'.
+    Parse a date-like input into a 'datetime.date'.
 
     Parameters
     ----------
-    d : str or None
-        Date string in one of two supported formats: 'YYYY-MM-DD'
-        (any pandas-parseable date) or 'YYYYMM' (year-month, six
-        digits). 'None' returns 'None'.
+    d : str, datetime.date, or None
+        Date in one of two supported string formats: 'YYYY-MM-DD' (an
+        ISO date) or 'YYYYMM' (year-month, six digits). Date and
+        datetime objects are accepted directly. 'None' returns 'None'.
     is_end : bool, default False
         Only relevant for the 'YYYYMM' form. When 'True', shift the
-        parsed timestamp to the last day of that month; when 'False',
-        the timestamp is the first day of the month.
+        parsed date to the last day of that month; when 'False', the
+        date is the first day of the month.
 
     Returns
     -------
-    pd.Timestamp or None
-        Normalized timestamp at midnight (time component stripped),
-        or 'None' if 'd' was 'None'.
+    datetime.date or None
+        Parsed calendar date, or 'None' if 'd' was 'None'.
     """
     if d is None:
         return None
+    if isinstance(d, dt.datetime):
+        return d.date()
+    if isinstance(d, dt.date):
+        return d
     d = str(d)
     if len(d) == 6 and d.isdigit():  # YYYYMM
-        ts = pd.to_datetime(d, format="%Y%m")
+        year, month = int(d[:4]), int(d[4:])
         if is_end:
-            # Move to last day of the month
-            ts = ts + pd.offsets.MonthEnd(0)
-        return ts.normalize()
-    return pd.to_datetime(d).normalize()
+            day = calendar.monthrange(year, month)[1]
+        else:
+            day = 1
+        return dt.date(year, month, day)
+    return dt.date.fromisoformat(d[:10])
 
 
 def _validate_dates(
-    start_date: str = None,
-    end_date: str = None,
+    start_date=None,
+    end_date=None,
     use_default_range: bool = False,
-) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+) -> tuple[dt.date | None, dt.date | None]:
     """
     Validate and process start and end dates.
 
@@ -58,21 +72,25 @@ def _validate_dates(
     Returns
     -------
     tuple
-        A tuple containing the validated start and end dates.
+        A tuple containing the validated start and end dates as
+        'datetime.date' objects (or 'None').
     """
     if start_date is None and end_date is None:
         if use_default_range:
-            today = pd.Timestamp.today().normalize()
-            start_date = today - pd.DateOffset(years=2)
-            end_date = today - pd.DateOffset(years=1)
+            today = dt.date.today()
+            start_date = _shift_years(today, -2)
+            end_date = _shift_years(today, -1)
             print(
                 "No start_date or end_date provided. Using the range "
-                f"{start_date.date()} to {end_date.date()} to avoid "
+                f"{start_date} to {end_date} to avoid "
                 "downloading large amounts of data."
             )
-            return start_date.date(), end_date.date()
+            return start_date, end_date
         else:
-            print("No start_date or end_date provided. " "Returning the full dataset.")
+            print(
+                "No start_date or end_date provided. "
+                "Returning the full dataset."
+            )
             return None, None
 
     start_date = _parse_date(start_date, is_end=False) if start_date else None
@@ -89,25 +107,6 @@ def _validate_dates(
     if start_date > end_date:
         raise ValueError("start_date cannot be after end_date.")
     return start_date, end_date
-
-
-def _return_datetime(dates):
-    """
-    Coerce a date-like series to 'datetime64[ns]' via string round-trip.
-
-    Parameters
-    ----------
-    dates : pd.Series or pd.Index
-        Series whose entries can be cast to string and parsed by
-        'pd.to_datetime' (e.g., 'PeriodIndex', date objects,
-        date strings).
-
-    Returns
-    -------
-    pd.DatetimeIndex
-        Parsed timestamps with no time-of-day component.
-    """
-    return pd.to_datetime(dates.astype(str))
 
 
 def _transfrom_to_snake_case(column_name):
@@ -130,7 +129,9 @@ def _transfrom_to_snake_case(column_name):
     """
     column_name = re.sub(r"(?<!^)(?=[A-Z])", "_", column_name)
     column_name = column_name.replace(" ", "_").replace("-", "_").lower()
-    column_name = "".join(c if c.isalnum() or c == "_" else "_" for c in column_name)
+    column_name = "".join(
+        c if c.isalnum() or c == "_" else "_" for c in column_name
+    )
 
     while "__" in column_name:
         column_name = column_name.replace("__", "_")
@@ -170,39 +171,112 @@ def _get_random_user_agent():
     return str(np.random.choice(user_agents))
 
 
-def _to_offset(x):
+# Units accepted in polars duration strings (subset relevant for lags).
+_POLARS_OFFSET_RE = re.compile(r"^(\d+(d|w|mo|q|y))+$")
+
+
+def _to_offset(x) -> str:
     """
-    Normalize a lag specification to a pandas time offset.
+    Normalize a lag specification to a polars offset string.
 
     Parameters
     ----------
-    x : int, pd.Timedelta, or pd.DateOffset
+    x : int, str, datetime.timedelta, pd.Timedelta, or pd.DateOffset
         Lag value. Integers are interpreted as a number of days.
-        'pd.Timedelta' and 'pd.DateOffset' instances are returned
-        unchanged.
+        Strings must be positive polars duration strings composed of
+        'd', 'w', 'mo', 'q', or 'y' units (e.g. '1mo', '3d', '1y2mo').
+        'datetime.timedelta' / 'pd.Timedelta' values are converted to
+        days (they must represent whole days), and calendar-based
+        'pd.DateOffset' objects (with 'years', 'months', 'weeks', or
+        'days' components) are translated to the equivalent duration
+        string.
 
     Returns
     -------
-    pd.Timedelta or pd.DateOffset
-        An offset object suitable for date arithmetic.
+    str
+        A polars offset string suitable for
+        'polars.Expr.dt.offset_by'.
 
     Raises
     ------
     TypeError
         If 'x' is not one of the supported types (booleans are
         rejected even though they subclass 'int').
+    ValueError
+        If a string is not a valid positive polars duration, a
+        timedelta does not represent whole days, or a 'pd.DateOffset'
+        uses unsupported components.
     """
-    if isinstance(x, int) and not isinstance(x, bool):
-        return pd.Timedelta(days=x)
-    if isinstance(x, (pd.Timedelta, pd.tseries.offsets.BaseOffset)):
+    if isinstance(x, bool):
+        raise TypeError(
+            "lag/max_lag must be int, str, timedelta, or DateOffset; "
+            "got bool."
+        )
+    if isinstance(x, int):
+        if x < 0:
+            raise ValueError("lag/max_lag must be non-negative.")
+        return f"{x}d"
+    if isinstance(x, str):
+        if not _POLARS_OFFSET_RE.match(x):
+            raise ValueError(
+                f"Invalid offset string {x!r}. Use positive polars "
+                "durations composed of 'd', 'w', 'mo', 'q', or 'y', "
+                "e.g. '1mo' or '1y2mo'."
+            )
         return x
+    if isinstance(x, dt.timedelta):
+        # Covers pd.Timedelta, which subclasses datetime.timedelta.
+        if x.seconds or x.microseconds:
+            raise ValueError(
+                "Timedelta lags must represent whole days for "
+                "calendar-date data."
+            )
+        if x.days < 0:
+            raise ValueError("lag/max_lag must be non-negative.")
+        return f"{x.days}d"
+
+    # Calendar offsets (pd.DateOffset) without importing pandas up
+    # front: detect by the characteristic 'kwds'/'n' attributes.
+    if type(x).__name__ == "DateOffset" and hasattr(x, "kwds"):
+        allowed = ("years", "months", "weeks", "days")
+        unsupported = [k for k in x.kwds if k not in allowed]
+        if unsupported:
+            raise ValueError(
+                "Unsupported DateOffset components for lags: "
+                f"{unsupported}. Use years, months, weeks, or days."
+            )
+        n = getattr(x, "n", 1)
+        unit_map = {"years": "y", "months": "mo", "weeks": "w", "days": "d"}
+        parts = []
+        for k in allowed:
+            value = x.kwds.get(k, 0) * n
+            if value < 0:
+                raise ValueError("lag/max_lag must be non-negative.")
+            if value:
+                parts.append(f"{value}{unit_map[k]}")
+        return "".join(parts) if parts else "0d"
+
     raise TypeError(
-        f"lag/max_lag must be int, pd.Timedelta, or pd.DateOffset; "
+        f"lag/max_lag must be int, str, timedelta, or DateOffset; "
         f"got {type(x).__name__}."
     )
 
 
-def _check_new_col(data: pd.DataFrame, names) -> None:
+def _negate_offset(offset: str) -> str:
+    """Negate a positive polars offset string component-wise.
+
+    For example '1y2mo' becomes '-1y-2mo', which shifts dates
+    backwards when passed to 'polars.Expr.dt.offset_by'.
+    """
+    return re.sub(r"(\d+[a-z]+)", r"-\1", offset)
+
+
+def _offset_end(start: dt.date, offset: str) -> dt.date:
+    """Apply a polars offset string to a single date."""
+    return pl.Series([start]).dt.offset_by(offset).item()
+
+
+def _check_new_col(data: pl.DataFrame, names) -> None:
     """
     Guard against overwriting user columns with internal helpers.
 
@@ -213,7 +287,7 @@ def _check_new_col(data: pd.DataFrame, names) -> None:
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Input frame whose columns are checked.
     names : str or iterable of str
         Column name(s) the caller intends to introduce.

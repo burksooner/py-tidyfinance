@@ -59,3 +59,12 @@
 - **`sorting_variable` is now optional for `factor_library`:** it returns the default construction for all sorting variables when omitted, and passing `None` for a filter column removes that filter.
 - **Added `detail` parameter to `estimate_fama_macbeth`:** `detail=True` returns coefficients plus summary statistics (mean `r_squared`, `adj_r_squared`, `n_obs`). Default unchanged.
 - **Dependencies (replaced pyfixest with formulaic):** dropped `pyfixest` for `formulaic`.
+
+## v0.5.0 (2026-07-29)
+
+- **Polars rewrite:** the entire package is now implemented in [polars](https://pola.rs/). All module-level functions take and return `polars.DataFrame` objects, calendar-date columns are typed as `polars.Date` (matching the R package and the book), and the `polars` backend (`set_backend("polars")`, as used throughout the Tidy Finance book) is a zero-overhead pass-through. The public API and the default `pandas` backend are unchanged: pandas users keep receiving pandas frames, with conversion now happening at the package boundary (pandas in → polars internals → pandas out). `polars` moved from an optional extra to a core dependency.
+- **Missing values are nulls:** data frame outputs now represent missing values as polars nulls (surfacing as `NaN`/`NaT` after conversion under the pandas backend), instead of float `NaN` sentinels.
+- **Breaking (`create_summary_statistics`):** output columns now follow the R package naming — `n`, `mean`, `sd`, `min`, `q50`, `max` (plus `q01`…`q99` with `detail=True`) — and grouped summaries return a tidy long table (one row per group × variable) instead of pandas MultiIndex columns.
+- **Breaking (`assign_portfolio`):** returns a `polars.Series` under the polars backend (a `pandas.Series` under the default pandas backend, as before).
+- **Lag arguments accept polars duration strings:** `add_lagged_columns` / `join_lagged_values` accept lags as polars offsets (e.g. `"1mo"`, `"1y2mo"`) in addition to ints (days), `datetime.timedelta`/`pd.Timedelta`, and calendar `pd.DateOffset` objects.
+- **Internal SQL and HTTP readers now parse directly into polars** (`polars.read_database` for WRDS, `polars.read_csv`/`read_parquet` on fetched bytes elsewhere).
