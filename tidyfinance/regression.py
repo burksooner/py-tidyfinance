@@ -166,10 +166,12 @@ def estimate_betas(
     -------
     pl.DataFrame
         Data frame with the estimated betas for each stock and time
-        period. Contains one column per model term (the intercept, when
-        present, is named 'Intercept'), the stock identifier, and the
-        'date' column. Windows with fewer than 'min_obs' observations
-        yield null coefficients.
+        period. Contains the stock identifier and the 'date' column,
+        followed by one column per model term: an 'intercept' column
+        (when the model includes one) and one 'beta_<variable>' column
+        per regressor, matching r-tidyfinance's 'estimate_betas'.
+        Windows with fewer than 'min_obs' observations yield null
+        coefficients.
 
     Examples
     --------
@@ -200,7 +202,11 @@ def estimate_betas(
 
     dep_var, regressors, has_intercept = _parse_linear_formula(model)
 
-    coef_names = (["Intercept"] if has_intercept else []) + regressors
+    # Column names follow r-tidyfinance: a bare 'intercept' plus one
+    # 'beta_<variable>' per regressor.
+    coef_names = (["intercept"] if has_intercept else []) + [
+        f"beta_{name}" for name in regressors
+    ]
 
     results = []
     sorted_data = data.sort([id_col, "date"], maintain_order=True)
@@ -222,7 +228,7 @@ def estimate_betas(
         results.append(betas_df)
 
     betas_df = pl.concat(results)
-    return betas_df.select(coef_names + [id_col, "date"])
+    return betas_df.select([id_col, "date"] + coef_names)
 
 
 def _parse_linear_formula(model: str) -> tuple[str, list[str], bool]:
@@ -571,13 +577,17 @@ def estimate_fama_macbeth(
     -------
     pl.DataFrame or dict
         If 'detail' is 'False' (default), a data frame with one row per
-        term in 'model' with columns:
+        term in 'model', in model-term order (the intercept first, then
+        the regressors as they appear in the formula), with columns:
 
-        - 'factor' : term name (Intercept or regressor)
+        - 'factor' : term name ('intercept' or a regressor)
         - 'risk_premium' : time-series mean of cross-sectional coefficients
+        - 'n' : number of periods used
         - 'standard_error' : SE of the time-series mean under 'vcov'
         - 't_statistic' : risk_premium / standard_error
-        - 'n' : number of periods used
+
+        The column order and the 'intercept' label match
+        r-tidyfinance's 'estimate_fama_macbeth'.
 
         If 'detail' is 'True', a dict with two elements:
 
@@ -686,8 +696,13 @@ def estimate_fama_macbeth(
 
     # Compute time-series averages, standard errors, t-statistics, and
     # period counts per factor under the chosen vcov. Factors are
-    # reported in alphabetical order.
-    factors = sorted({name for coefs in cross_section_coefs for name in coefs})
+    # reported in model-term order (intercept first, then the
+    # regressors as they appear in the formula), matching
+    # r-tidyfinance; 'coef()' is insertion-ordered as in the design
+    # matrix, so first-appearance order reproduces it.
+    factors = list(
+        dict.fromkeys(name for coefs in cross_section_coefs for name in coefs)
+    )
 
     factor_col = []
     premium_col = []
@@ -722,19 +737,23 @@ def estimate_fama_macbeth(
                 t_stat = np.nan
             else:
                 t_stat = float(estimates.mean()) / float(se)
-        factor_col.append(factor)
+        # r-tidyfinance labels the intercept row 'intercept'; formulaic
+        # names the design-matrix column 'Intercept'.
+        factor_col.append("intercept" if factor == "Intercept" else factor)
         premium_col.append(risk_premium)
         se_col.append(float(se) if se is not None else np.nan)
         t_col.append(t_stat)
         n_col.append(n)
 
+    # Column order follows r-tidyfinance: factor, risk_premium, n,
+    # standard_error, t_statistic.
     result_df = pl.DataFrame(
         {
             "factor": pl.Series(factor_col, dtype=pl.String),
             "risk_premium": pl.Series(premium_col, dtype=pl.Float64),
+            "n": pl.Series(n_col, dtype=pl.Int64),
             "standard_error": pl.Series(se_col, dtype=pl.Float64),
             "t_statistic": pl.Series(t_col, dtype=pl.Float64),
-            "n": pl.Series(n_col, dtype=pl.Int64),
         }
     ).with_columns(
         pl.col("risk_premium", "standard_error", "t_statistic").fill_nan(None)

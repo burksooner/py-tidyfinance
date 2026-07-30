@@ -196,7 +196,7 @@ def test_estimate_rolling_betas_basic(sample_data: pl.DataFrame) -> None:
     lookback = 30
     result = estimate_betas(sample_data, "ret_excess ~ mkt_excess", lookback)
     assert not result.is_empty(), "Result should not be empty"
-    assert "mkt_excess" in result.columns, (
+    assert "beta_mkt_excess" in result.columns, (
         "Output should include beta estimate for mkt_excess"
     )
 
@@ -208,7 +208,7 @@ def test_estimate_rolling_betas_min_obs(sample_data: pl.DataFrame) -> None:
         sample_data, "ret_excess ~ mkt_excess", lookback, min_obs=min_obs
     )
     assert result.height > 0, "Result should have valid estimates"
-    assert result["mkt_excess"].is_null().sum() > 0, (
+    assert result["beta_mkt_excess"].is_null().sum() > 0, (
         "Some estimates should be null due to min_obs constraint"
     )
 
@@ -242,10 +242,10 @@ def test_estimate_betas_default_min_obs_is_80_percent(
 def test_estimate_betas_without_intercept_omits_intercept_column(
     sample_data: pl.DataFrame,
 ) -> None:
-    """A '- 1' formula omits the Intercept column."""
+    """A '- 1' formula omits the intercept column."""
     result = estimate_betas(sample_data, "ret_excess ~ mkt_excess - 1", 30)
-    assert "Intercept" not in result.columns
-    assert "mkt_excess" in result.columns
+    assert "intercept" not in result.columns
+    assert "beta_mkt_excess" in result.columns
 
 
 def test_estimate_betas_match_per_window_ols(
@@ -269,7 +269,7 @@ def test_estimate_betas_match_per_window_ols(
         (pl.col("permno") == 1) & (pl.col("date") == group["date"][i])
     )
     np.testing.assert_allclose(
-        row.select(["Intercept", "mkt_excess"]).to_numpy()[0],
+        row.select(["intercept", "beta_mkt_excess"]).to_numpy()[0],
         expected,
         rtol=1e-8,
     )
@@ -463,7 +463,7 @@ def test_estimate_fama_macbeth_newey_west_matches_r() -> None:
     rp = dict(zip(out["factor"].to_list(), out["risk_premium"].to_list()))
     # Reference values are rounded to 3 decimals, so compare within half a
     # unit in the last place (abs=5e-4).
-    assert t["Intercept"] == pytest.approx(-0.792, abs=5e-4)
+    assert t["intercept"] == pytest.approx(-0.792, abs=5e-4)
     assert t["beta"] == pytest.approx(2.301, abs=5e-4)
     assert t["bm"] == pytest.approx(1.005, abs=5e-4)
     assert t["size"] == pytest.approx(0.887, abs=5e-4)
