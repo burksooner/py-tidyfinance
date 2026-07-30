@@ -486,9 +486,7 @@ def _download_factor_library_ids(ids: list) -> pl.DataFrame:
     organization = "tidy-finance"
     dataset_name = "factor-library"
 
-    path_pattern = (
-        r"sorting_variable=([^/]+)/sorting_variable_lag=([^/]+)/"
-    )
+    path_pattern = r"sorting_variable=([^/]+)/sorting_variable_lag=([^/]+)/"
     available_files = _get_available_huggingface_files(
         organization, dataset_name
     )
@@ -812,14 +810,14 @@ def _download_data_huggingface(
             .str.to_date()
         )
 
-        requested_dates = pl.date_range(
-            _parse_date(start_date),
-            _parse_date(end_date),
-            interval="1d",
-            eager=True,
-        )
+        # The requested window is a contiguous daily range, so a bounds
+        # check is equivalent to membership in the expanded date list and
+        # avoids polars' ambiguous 'is_in' against a Series of the same
+        # dtype (deprecated in polars >= 1.31).
         files_to_download = available_files.filter(
-            pl.col("date").is_in(requested_dates)
+            pl.col("date").is_between(
+                _parse_date(start_date), _parse_date(end_date)
+            )
         )
 
         if files_to_download.is_empty():
