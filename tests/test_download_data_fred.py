@@ -1,10 +1,11 @@
 """Tests for download_data_fred."""
 
+import datetime as dt
 import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -23,16 +24,17 @@ def test_downloads_parses_and_filters_fred_data():
     response_mock.raise_for_status = MagicMock()
 
     with patch(
-        "tidyfinance.download_open_source.requests.get", return_value=response_mock
+        "tidyfinance.download_open_source.requests.get",
+        return_value=response_mock,
     ):
         result = _download_data_fred(
             "GDP", start_date="2020-02-01", end_date="2020-02-01"
         )
 
-    assert isinstance(result, pd.DataFrame)
-    assert result["date"].iloc[0] == pd.Timestamp("2020-02-01")
-    assert result["value"].iloc[0] == 2
-    assert result["series"].iloc[0] == "GDP"
+    assert isinstance(result, pl.DataFrame)
+    assert result["date"][0] == dt.date(2020, 2, 1)
+    assert result["value"][0] == 2
+    assert result["series"][0] == "GDP"
 
 
 def test_returns_empty_data_when_fred_responds_with_non_200_status():
@@ -42,16 +44,17 @@ def test_returns_empty_data_when_fred_responds_with_non_200_status():
     response_mock.raise_for_status.side_effect = Exception("404 error")
 
     with patch(
-        "tidyfinance.download_open_source.requests.get", return_value=response_mock
+        "tidyfinance.download_open_source.requests.get",
+        return_value=response_mock,
     ):
         with pytest.warns(
             UserWarning, match="Failed to retrieve data for series GDP"
         ):
             result = _download_data_fred("GDP")
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
-    assert list(result.columns) == ["date", "series", "value"]
+    assert result.columns == ["date", "series", "value"]
 
 
 def test_returns_empty_data_when_download_handling_returns_none():
@@ -65,9 +68,9 @@ def test_returns_empty_data_when_download_handling_returns_none():
         ):
             result = _download_data_fred("GDP")
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
-    assert list(result.columns) == ["date", "series", "value"]
+    assert result.columns == ["date", "series", "value"]
 
 
 if __name__ == "__main__":

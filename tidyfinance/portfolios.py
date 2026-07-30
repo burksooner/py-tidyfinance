@@ -3,10 +3,14 @@
 import warnings
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
-from ._internal import (_check_new_col, _validate_column_name, _validate_flag,
-                        _validate_optional_number)
+from ._internal import (
+    _check_new_col,
+    _validate_column_name,
+    _validate_flag,
+    _validate_optional_number,
+)
 
 
 def data_options(
@@ -102,12 +106,12 @@ def data_options(
 
 
 def assign_portfolio(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     sorting_variable: str,
     breakpoint_options: dict = None,
     breakpoint_function=None,
     data_options: dict = None,
-) -> pd.Series:
+) -> pl.Series:
     """Assign data points to portfolios based on a sorting variable.
 
     Users may pass a custom function to compute breakpoints. The
@@ -118,7 +122,7 @@ def assign_portfolio(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Dataset for portfolio assignment.
     sorting_variable : str
         Column in 'data' used for sorting and portfolio assignment.
@@ -134,20 +138,20 @@ def assign_portfolio(
 
     Returns
     -------
-    pd.Series
-        Portfolio assignments as a float series. Each entry is the
-        1-indexed portfolio number; values outside the breakpoint
-        range fall into the boundary portfolios. NaN inputs are
-        returned as NaN.
+    pl.Series
+        Portfolio assignments as a Float64 series aligned with the
+        input rows. Each entry is the 1-indexed portfolio number;
+        values outside the breakpoint range fall into the boundary
+        portfolios. Missing inputs are returned as null.
 
     Examples
     --------
     ```python
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import assign_portfolio, breakpoint_options
     rng = np.random.default_rng(42)
-    data = pd.DataFrame({
+    data = pl.DataFrame({
         'exchange': rng.choice(['NYSE', 'NASDAQ'], 100),
         'market_cap': rng.uniform(1, 100, 100),
     })
@@ -170,11 +174,11 @@ def assign_portfolio(
             f"Sorting variable '{sorting_variable}' not found in data."
         )
 
-    x = data[sorting_variable]
+    x = data.get_column(sorting_variable).cast(pl.Float64).fill_nan(None)
     n = len(x)
 
-    # Constant check: count of distinct non-NaN values.
-    non_na = x.dropna().values
+    # Constant check: count of distinct non-missing values.
+    non_na = x.drop_nulls().to_numpy()
     if len(np.unique(non_na)) <= 1:
         warnings.warn(
             "The sorting variable is constant and only one portfolio "
@@ -182,40 +186,38 @@ def assign_portfolio(
             UserWarning,
             stacklevel=2,
         )
-        return pd.Series([1.0] * n, index=data.index, dtype=float)
+        return pl.Series("portfolio", [1.0] * n, dtype=pl.Float64)
 
     breakpoints = breakpoint_function(
         data, sorting_variable, breakpoint_options, data_options
     )
 
     breakpoints = np.asarray(breakpoints, dtype=float)
-    if np.any(pd.isna(breakpoints)):
+    if np.any(np.isnan(breakpoints)):
         warnings.warn(
             "No portfolios were assigned due to missing breakpoints.",
             UserWarning,
             stacklevel=2,
         )
-        return pd.Series([np.nan] * n, index=data.index, dtype=float)
+        return pl.Series("portfolio", [None] * n, dtype=pl.Float64)
 
-    # Extend the outer breakpoint edges to +/- infinity so values
-    # outside the original range still fall into a boundary
-    # portfolio rather than NaN.
-    extended_bins = breakpoints.copy()
-    extended_bins[0] = -np.inf
-    extended_bins[-1] = np.inf
-
-    cut_result = pd.cut(
-        x,
-        bins=extended_bins,
-        labels=range(1, len(breakpoints)),
-        right=False,
+    # The outer breakpoint edges are treated as -/+ infinity so values
+    # outside the original range still fall into a boundary portfolio.
+    # Intervals are closed on the left and open on the right, so the
+    # portfolio index is the count of interior breakpoints <= x plus 1.
+    xa = x.to_numpy()
+    assignments = (
+        np.searchsorted(breakpoints[1:-1], xa, side="right") + 1.0
     )
-    result = cut_result.astype(float)
+    assignments = np.where(np.isnan(xa), np.nan, assignments)
+    result = pl.Series(
+        "portfolio", assignments, dtype=pl.Float64
+    ).fill_nan(None)
 
     # Cluster warning: number of populated portfolios differs from
     # the expected count (ties collapsed adjacent breakpoints).
     n_expected = len(breakpoints) - 1
-    n_actual = result.dropna().nunique()
+    n_actual = result.drop_nulls().n_unique()
     if n_actual != n_expected:
         warnings.warn(
             "The number of portfolios differs from the specified "
@@ -371,7 +373,7 @@ def breakpoint_options(
 
 
 def compute_breakpoints(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     sorting_variable: str,
     breakpoint_options: dict,
     data_options: dict = None,
@@ -389,7 +391,7 @@ def compute_breakpoints(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         DataFrame with the dataset for breakpoint computation.
     sorting_variable : str
         Column name in 'data' to be used for determining breakpoints.
@@ -444,10 +446,10 @@ def compute_breakpoints(
     --------
     ```python
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import compute_breakpoints, breakpoint_options
     rng = np.random.default_rng(42)
-    data = pd.DataFrame({
+    data = pl.DataFrame({
         'id': range(1, 101),
         'exchange': rng.choice(['NYSE', 'NASDAQ'], 100),
         'market_cap': range(1, 101),
@@ -488,7 +490,10 @@ def compute_breakpoints(
             "You must provide either 'n_portfolios' or 'percentiles'."
         )
 
-    sorting_values = data[sorting_variable].values
+    sorting_all = (
+        data.get_column(sorting_variable).cast(pl.Float64).to_numpy()
+    )
+    sorting_values = sorting_all
 
     keep_mask = None
     if breakpoints_exchanges is not None:
@@ -503,8 +508,13 @@ def compute_breakpoints(
             if isinstance(breakpoints_exchanges, str)
             else list(breakpoints_exchanges)
         )
-        keep_mask = data[exchange_col].isin(exchanges_list).values
-        sorting_values = sorting_values[keep_mask]
+        keep_mask = (
+            data.get_column(exchange_col)
+            .is_in(exchanges_list)
+            .fill_null(False)
+            .to_numpy()
+        )
+        sorting_values = sorting_all[keep_mask]
 
     if breakpoints_min_size_threshold is not None:
         mktcap_col = data_options["mktcap_lag"]
@@ -513,20 +523,22 @@ def compute_breakpoints(
                 f"Column '{mktcap_col}' is required when using "
                 "'breakpoints_min_size_threshold'."
             )
+        all_mktcap = (
+            data.get_column(mktcap_col).cast(pl.Float64).to_numpy()
+        )
         if keep_mask is not None:
-            mktcap_ref = data[mktcap_col].values[keep_mask]
+            mktcap_ref = all_mktcap[keep_mask]
         else:
-            mktcap_ref = data[mktcap_col].values
-        mktcap_ref_clean = mktcap_ref[~pd.isna(mktcap_ref)]
+            mktcap_ref = all_mktcap
+        mktcap_ref_clean = mktcap_ref[~np.isnan(mktcap_ref)]
         size_cutoff = np.quantile(
             mktcap_ref_clean, breakpoints_min_size_threshold
         )
-        all_mktcap = data[mktcap_col].values
-        above_size = (~pd.isna(all_mktcap)) & (all_mktcap > size_cutoff)
+        above_size = (~np.isnan(all_mktcap)) & (all_mktcap > size_cutoff)
         combined_mask = (
             keep_mask & above_size if keep_mask is not None else above_size
         )
-        sorting_values = data[sorting_variable].values[combined_mask]
+        sorting_values = sorting_all[combined_mask]
 
     if len(sorting_values) == 0:
         warnings.warn(
@@ -546,7 +558,7 @@ def compute_breakpoints(
         probs = np.concatenate([[0], np.asarray(percentiles), [1]])
         n_portfolios = len(probs) - 1
 
-    sorting_values_clean = sorting_values[~pd.isna(sorting_values)]
+    sorting_values_clean = sorting_values[~np.isnan(sorting_values)]
     breakpoints = np.quantile(sorting_values_clean, probs)
 
     if smooth_bunching:
@@ -858,22 +870,23 @@ def portfolio_sort_options(
 
 
 def _summarise_portfolio_returns(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     group_cols: list,
     ret_col: str,
     w_col: str,
     w_capped_col: str,
     min_portfolio_size: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Compute vw, ew, and vw_capped returns within groups.
 
-    Groups with fewer than min_portfolio_size observations get NaN
+    Groups with fewer than min_portfolio_size observations get null
     in all three return columns. Groups whose weight sum is zero get
-    NaN in the corresponding weighted return.
+    null in the corresponding weighted return. Rows with a null value
+    in any group column are excluded.
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Stock-level panel with the return and weight columns.
     group_cols : list
         Columns to group by (typically the portfolio and date columns).
@@ -884,57 +897,64 @@ def _summarise_portfolio_returns(
     w_capped_col : str
         Capped market-cap weight column name.
     min_portfolio_size : int
-        Minimum observations per group; groups below this size get NaN.
+        Minimum observations per group; groups below this size get
+        null.
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         One row per group with columns from group_cols plus
         ret_excess_vw, ret_excess_ew, and ret_excess_vw_capped.
     """
-    work = data.copy()
-    work["_rw"] = work[ret_col] * work[w_col]
-    work["_rwc"] = work[ret_col] * work[w_capped_col]
-
-    sums = work.groupby(group_cols, as_index=False).agg(
-        _n=(ret_col, "size"),
-        _r_sum=(ret_col, "sum"),
-        _w_sum=(w_col, "sum"),
-        _wc_sum=(w_capped_col, "sum"),
-        _rw_sum=("_rw", "sum"),
-        _rwc_sum=("_rwc", "sum"),
+    work = data.filter(
+        pl.all_horizontal([pl.col(c).is_not_null() for c in group_cols])
     )
 
-    sums["ret_excess_ew"] = sums["_r_sum"] / sums["_n"]
-    sums["ret_excess_vw"] = np.where(
-        sums["_w_sum"] == 0, np.nan, sums["_rw_sum"] / sums["_w_sum"]
-    )
-    sums["ret_excess_vw_capped"] = np.where(
-        sums["_wc_sum"] == 0,
-        np.nan,
-        sums["_rwc_sum"] / sums["_wc_sum"],
+    sums = work.group_by(group_cols, maintain_order=True).agg(
+        _n=pl.len(),
+        _r_sum=pl.col(ret_col).sum(),
+        _w_sum=pl.col(w_col).sum(),
+        _wc_sum=pl.col(w_capped_col).sum(),
+        _rw_sum=(pl.col(ret_col) * pl.col(w_col)).sum(),
+        _rwc_sum=(pl.col(ret_col) * pl.col(w_capped_col)).sum(),
     )
 
-    too_small = sums["_n"] < min_portfolio_size
-    sums.loc[
-        too_small,
-        ["ret_excess_vw", "ret_excess_ew", "ret_excess_vw_capped"],
-    ] = np.nan
+    sums = sums.with_columns(
+        ret_excess_ew=pl.col("_r_sum") / pl.col("_n"),
+        ret_excess_vw=pl.when(pl.col("_w_sum") == 0)
+        .then(None)
+        .otherwise(pl.col("_rw_sum") / pl.col("_w_sum")),
+        ret_excess_vw_capped=pl.when(pl.col("_wc_sum") == 0)
+        .then(None)
+        .otherwise(pl.col("_rwc_sum") / pl.col("_wc_sum")),
+    )
 
-    return sums[
+    too_small = pl.col("_n") < min_portfolio_size
+    sums = sums.with_columns(
+        [
+            pl.when(too_small).then(None).otherwise(pl.col(c)).alias(c)
+            for c in (
+                "ret_excess_vw",
+                "ret_excess_ew",
+                "ret_excess_vw_capped",
+            )
+        ]
+    )
+
+    return sums.select(
         list(group_cols)
         + ["ret_excess_vw", "ret_excess_ew", "ret_excess_vw_capped"]
-    ]
+    )
 
 
 def _aggregate_bivariate_returns(
-    portfolio_returns: pd.DataFrame,
+    portfolio_returns: pl.DataFrame,
     date_col: str,
     ret_col: str,
     w_col: str,
     w_capped_col: str,
     min_portfolio_size: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Aggregate bivariate-sort returns across the secondary dimension.
 
     Computes cell-level returns over (portfolio_main,
@@ -945,27 +965,28 @@ def _aggregate_bivariate_returns(
 
     Parameters
     ----------
-    portfolio_returns : pd.DataFrame
+    portfolio_returns : pl.DataFrame
         Panel with columns portfolio_main, portfolio_secondary, the
         date column, and per-stock returns/weights.
     date_col, ret_col, w_col, w_capped_col : str
         Column names.
     min_portfolio_size : int
         Minimum firms per reported (portfolio_main, date) cross-section.
-        Cross-sections below this size receive NaN.
+        Cross-sections below this size receive null.
 
     Returns
     -------
-    pd.DataFrame
-        Columns portfolio, the date column, and the three return columns.
+    pl.DataFrame
+        Columns portfolio, the date column, and the three return
+        columns.
     """
     n_per_main = (
-        portfolio_returns.dropna(
-            subset=["portfolio_main", "portfolio_secondary"]
+        portfolio_returns.filter(
+            pl.col("portfolio_main").is_not_null()
+            & pl.col("portfolio_secondary").is_not_null()
         )
-        .groupby(["portfolio_main", date_col], as_index=False)
-        .size()
-        .rename(columns={"size": "n_firms"})
+        .group_by(["portfolio_main", date_col], maintain_order=True)
+        .agg(n_firms=pl.len())
     )
 
     cell_returns = _summarise_portfolio_returns(
@@ -978,40 +999,46 @@ def _aggregate_bivariate_returns(
     )
 
     avg_returns = (
-        cell_returns.groupby(["portfolio_main", date_col], as_index=False)
+        cell_returns.group_by(["portfolio_main", date_col], maintain_order=True)
         .agg(
-            ret_excess_vw=("ret_excess_vw", "mean"),
-            ret_excess_ew=("ret_excess_ew", "mean"),
-            ret_excess_vw_capped=("ret_excess_vw_capped", "mean"),
+            ret_excess_vw=pl.col("ret_excess_vw").mean(),
+            ret_excess_ew=pl.col("ret_excess_ew").mean(),
+            ret_excess_vw_capped=pl.col("ret_excess_vw_capped").mean(),
         )
-        .rename(columns={"portfolio_main": "portfolio"})
+        .rename({"portfolio_main": "portfolio"})
     )
 
-    n_renamed = n_per_main.rename(columns={"portfolio_main": "portfolio"})
-    result = avg_returns.merge(
-        n_renamed, on=["portfolio", date_col], how="left"
+    result = avg_returns.join(
+        n_per_main.rename({"portfolio_main": "portfolio"}),
+        on=["portfolio", date_col],
+        how="left",
+        maintain_order="left",
     )
 
-    insufficient = result["n_firms"].isna() | (
-        result["n_firms"] < min_portfolio_size
+    insufficient = pl.col("n_firms").is_null() | (
+        pl.col("n_firms") < min_portfolio_size
     )
-    for col in (
-        "ret_excess_vw",
-        "ret_excess_ew",
-        "ret_excess_vw_capped",
-    ):
-        result.loc[result[col].isna() | insufficient, col] = np.nan
+    result = result.with_columns(
+        [
+            pl.when(insufficient).then(None).otherwise(pl.col(c)).alias(c)
+            for c in (
+                "ret_excess_vw",
+                "ret_excess_ew",
+                "ret_excess_vw_capped",
+            )
+        ]
+    )
 
-    return result.drop(columns="n_firms")
+    return result.drop("n_firms")
 
 
 def _join_rebalanced_portfolios(
-    data: pd.DataFrame,
-    portfolio_data: pd.DataFrame,
+    data: pl.DataFrame,
+    portfolio_data: pl.DataFrame,
     date_col: str,
     id_col: str,
     rebalancing_month: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Join annual portfolio assignments to all dates in rebalancing window.
 
     Each date in 'data' is matched to the most recent portfolio
@@ -1020,9 +1047,9 @@ def _join_rebalanced_portfolios(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Full stock-level panel.
-    portfolio_data : pd.DataFrame
+    portfolio_data : pl.DataFrame
         Portfolio assignments at rebalancing dates. Must contain
         id_col, date_col, and one or more portfolio columns.
     date_col, id_col : str
@@ -1032,27 +1059,30 @@ def _join_rebalanced_portfolios(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         'data' with the portfolio columns joined from 'portfolio_data'
-        (NaN where no rebalancing window matches).
+        (null where no rebalancing window matches).
     """
+    window_year = (
+        pl.when(pl.col(date_col).dt.month() >= rebalancing_month)
+        .then(pl.col(date_col).dt.year())
+        .otherwise(pl.col(date_col).dt.year() - 1)
+        .alias("_window_year")
+    )
 
-    def _window_year(d):
-        return d.year if d.month >= rebalancing_month else d.year - 1
+    data_w = data.with_columns(window_year)
+    pd_w = portfolio_data.with_columns(
+        pl.col(date_col).dt.year().alias("_window_year")
+    ).drop(date_col)
 
-    data_w = data.copy()
-    data_w["_window_year"] = data_w[date_col].apply(_window_year)
-
-    pd_w = portfolio_data.copy()
-    pd_w["_window_year"] = pd_w[date_col].dt.year
-    pd_w = pd_w.drop(columns=date_col)
-
-    merged = data_w.merge(pd_w, on=[id_col, "_window_year"], how="left")
-    return merged.drop(columns="_window_year")
+    merged = data_w.join(
+        pd_w, on=[id_col, "_window_year"], how="left", maintain_order="left"
+    )
+    return merged.drop("_window_year")
 
 
 def compute_portfolio_returns(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     sorting_variables,
     sorting_method: str,
     rebalancing_month: int = None,
@@ -1064,7 +1094,7 @@ def compute_portfolio_returns(
     cap_weight: float = 0.8,
     data_options: dict = None,
     quiet: bool = False,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Compute portfolio returns.
 
     Computes individual portfolio returns based on specified sorting
@@ -1085,7 +1115,7 @@ def compute_portfolio_returns(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Stock-level panel. Must contain the id, date, and excess
         return columns (configurable via 'data_options'), the sorting
         variable(s), and optionally a market-cap lag column for
@@ -1127,8 +1157,8 @@ def compute_portfolio_returns(
         firms per portfolio-date; for bivariate sorts that is firms
         per main-portfolio-date summed across the secondary buckets.
         Cross-sections below the threshold have their returns set to
-        NaN. A typical value is 5 (the Fama-French convention). Set to
-        0 to deactivate the check entirely.
+        null. A typical value is 5 (the Fama-French convention). Set
+        to 0 to deactivate the check entirely.
     cap_weight : float, default 0.8
         Quantile of the cross-sectional 'mktcap_lag' distribution at
         which market capitalizations are capped per date when computing
@@ -1144,7 +1174,7 @@ def compute_portfolio_returns(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Data frame with computed portfolio returns as a complete panel
         (all portfolio-date combinations), containing:
 
@@ -1152,14 +1182,14 @@ def compute_portfolio_returns(
         - date column (as in 'data_options'): Date of the portfolio
           return.
         - 'ret_excess_vw': Value-weighted excess return (only if 'data'
-          contains the market-cap lag column). NaN if insufficient
+          contains the market-cap lag column). Null if insufficient
           observations.
-        - 'ret_excess_ew': Equal-weighted excess return. NaN if
+        - 'ret_excess_ew': Equal-weighted excess return. Null if
           insufficient observations.
         - 'ret_excess_vw_capped': Capped value-weighted excess return
           (only if 'data' contains the market-cap lag column). Weights
           are computed using market capitalization capped at the
-          'cap_weight' percentile per date. NaN if insufficient
+          'cap_weight' percentile per date. Null if insufficient
           observations.
 
     Notes
@@ -1172,17 +1202,20 @@ def compute_portfolio_returns(
     Examples
     --------
     ```python
+    import datetime as dt
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import (
         compute_portfolio_returns,
         breakpoint_options,
     )
     rng = np.random.default_rng(42)
-    dates = pd.date_range('2020-01-01', periods=100, freq='MS')
-    data = pd.DataFrame({
+    dates = pl.date_range(
+        dt.date(2020, 1, 1), dt.date(2028, 4, 1), '1mo', eager=True
+    )
+    data = pl.DataFrame({
         'permno': range(1, 501),
-        'date': np.repeat(dates, 5),
+        'date': dates.to_numpy().repeat(5),
         'mktcap_lag': rng.uniform(100, 1000, 500),
         'ret_excess': rng.standard_normal(500),
         'size': rng.uniform(50, 150, 500),
@@ -1248,7 +1281,7 @@ def compute_portfolio_returns(
     if (
         isinstance(cap_weight, bool)
         or not isinstance(cap_weight, (int, float))
-        or pd.isna(cap_weight)
+        or np.isnan(cap_weight)
         or cap_weight < 0
         or cap_weight > 1
     ):
@@ -1272,25 +1305,43 @@ def compute_portfolio_returns(
         raise ValueError(f"Missing columns: {', '.join(missing_columns)}.")
 
     mktcap_lag_missing = w_col not in data.columns
-    data = data.copy()
     if mktcap_lag_missing:
-        data[w_col] = 1
+        data = data.with_columns(pl.lit(1.0).alias(w_col))
 
-    all_dates = sorted(data[date_col].unique())
+    all_dates = data.get_column(date_col).unique().sort()
 
-    data = data.dropna(subset=list(sorting_variables))
+    # Treat float NaN as missing everywhere downstream.
+    float_cols = [
+        c
+        for c in set(list(sorting_variables) + [ret_col, w_col])
+        if data.schema[c] in (pl.Float32, pl.Float64)
+    ]
+    if float_cols:
+        data = data.with_columns(
+            [pl.col(c).fill_nan(None) for c in float_cols]
+        )
+    data = data.drop_nulls(subset=list(sorting_variables))
 
     _check_new_col(data, w_capped_col)
-    cap_quantile = data.groupby(date_col)[w_col].transform(
-        lambda x: x.quantile(cap_weight)
+    data = data.with_columns(
+        pl.min_horizontal(
+            pl.col(w_col),
+            pl.col(w_col)
+            .quantile(cap_weight, interpolation="linear")
+            .over(date_col),
+        ).alias(w_capped_col)
     )
-    data[w_capped_col] = np.minimum(data[w_col], cap_quantile)
 
-    missing_mcap = data[w_col].isna()
-    data.loc[missing_mcap, w_col] = 0
-    data.loc[missing_mcap, w_capped_col] = 0
+    missing_mcap = pl.col(w_col).is_null()
+    data = data.with_columns(
+        pl.when(missing_mcap).then(0.0).otherwise(pl.col(w_col)).alias(w_col),
+        pl.when(missing_mcap)
+        .then(0.0)
+        .otherwise(pl.col(w_capped_col))
+        .alias(w_capped_col),
+    )
 
-    if len(data) == 0:
+    if data.height == 0:
         if not quiet:
             warnings.warn(
                 "Returning an empty panel: all observations were "
@@ -1298,21 +1349,41 @@ def compute_portfolio_returns(
                 UserWarning,
                 stacklevel=2,
             )
-        cols = ["portfolio", date_col, "ret_excess_ew"]
-        if not mktcap_lag_missing:
-            cols = [
-                "portfolio",
-                date_col,
-                "ret_excess_vw",
-                "ret_excess_ew",
-                "ret_excess_vw_capped",
-            ]
-        return pd.DataFrame({c: [] for c in cols})
+        schema = {"portfolio": pl.Float64, date_col: data.schema[date_col]}
+        if mktcap_lag_missing:
+            schema["ret_excess_ew"] = pl.Float64
+        else:
+            schema["ret_excess_vw"] = pl.Float64
+            schema["ret_excess_ew"] = pl.Float64
+            schema["ret_excess_vw_capped"] = pl.Float64
+        return pl.DataFrame(schema=schema)
 
     if rebalancing_month is not None and (
         rebalancing_month < 1 or rebalancing_month > 12
     ):
         raise ValueError("Invalid rebalancing_month.")
+
+    def _assign_grouped(df, keys, sv, bp_opts, bp_fn, out_col):
+        """Assign portfolios within each group defined by 'keys'."""
+        parts = []
+        for part in df.partition_by(keys, maintain_order=True):
+            key_values = part.select(keys).row(0)
+            if any(v is None for v in key_values):
+                parts.append(
+                    part.with_columns(
+                        pl.lit(None, dtype=pl.Float64).alias(out_col)
+                    )
+                )
+                continue
+            assignments = assign_portfolio(
+                part.drop(keys),
+                sorting_variable=sv,
+                breakpoint_options=bp_opts,
+                breakpoint_function=bp_fn,
+                data_options=data_options,
+            )
+            parts.append(part.with_columns(assignments.alias(out_col)))
+        return pl.concat(parts)
 
     if sorting_method == "univariate":
         if len(sorting_variables) > 1:
@@ -1323,43 +1394,33 @@ def compute_portfolio_returns(
         sv = sorting_variables[0]
 
         if rebalancing_month is None:
-
-            def _assigner(g):
-                return assign_portfolio(
-                    g,
-                    sorting_variable=sv,
-                    breakpoint_options=breakpoint_options_main,
-                    breakpoint_function=breakpoint_function_main,
-                    data_options=data_options,
-                )
-
-            data["portfolio"] = data.groupby(date_col, group_keys=False).apply(
-                _assigner, include_groups=False
+            portfolio_returns = _assign_grouped(
+                data,
+                [date_col],
+                sv,
+                breakpoint_options_main,
+                breakpoint_function_main,
+                "portfolio",
             )
-            portfolio_returns = data
         else:
-            filtered_data = data[data[date_col].dt.month == rebalancing_month]
-            if len(filtered_data) == 0:
+            filtered_data = data.filter(
+                pl.col(date_col).dt.month() == rebalancing_month
+            )
+            if filtered_data.height == 0:
                 raise ValueError(
                     f"No observations match 'rebalancing_month' = "
                     f"{rebalancing_month}. Check that the data contains "
                     "dates in the specified rebalancing month."
                 )
 
-            def _assigner(g):
-                return assign_portfolio(
-                    g,
-                    sorting_variable=sv,
-                    breakpoint_options=breakpoint_options_main,
-                    breakpoint_function=breakpoint_function_main,
-                    data_options=data_options,
-                )
-
-            portfolio_data = filtered_data.copy()
-            portfolio_data["portfolio"] = portfolio_data.groupby(
-                date_col, group_keys=False
-            ).apply(_assigner, include_groups=False)
-            portfolio_data = portfolio_data[[id_col, date_col, "portfolio"]]
+            portfolio_data = _assign_grouped(
+                filtered_data,
+                [date_col],
+                sv,
+                breakpoint_options_main,
+                breakpoint_function_main,
+                "portfolio",
+            ).select([id_col, date_col, "portfolio"])
             portfolio_returns = _join_rebalanced_portfolios(
                 data,
                 portfolio_data,
@@ -1384,54 +1445,55 @@ def compute_portfolio_returns(
             )
         sv_main, sv_sec = sorting_variables[0], sorting_variables[1]
 
-        def _assign_main(g):
-            return assign_portfolio(
-                g,
-                sorting_variable=sv_main,
-                breakpoint_options=breakpoint_options_main,
-                breakpoint_function=breakpoint_function_main,
-                data_options=data_options,
-            )
-
-        def _assign_sec(g):
-            return assign_portfolio(
-                g,
-                sorting_variable=sv_sec,
-                breakpoint_options=breakpoint_options_secondary,
-                breakpoint_function=breakpoint_function_secondary,
-                data_options=data_options,
-            )
-
         if rebalancing_month is None:
-            data["portfolio_secondary"] = data.groupby(
-                date_col, group_keys=False
-            ).apply(_assign_sec, include_groups=False)
-            data["portfolio_main"] = data.groupby(
-                [date_col, "portfolio_secondary"], group_keys=False
-            ).apply(_assign_main, include_groups=False)
-            portfolio_returns = data
+            data = _assign_grouped(
+                data,
+                [date_col],
+                sv_sec,
+                breakpoint_options_secondary,
+                breakpoint_function_secondary,
+                "portfolio_secondary",
+            )
+            portfolio_returns = _assign_grouped(
+                data,
+                [date_col, "portfolio_secondary"],
+                sv_main,
+                breakpoint_options_main,
+                breakpoint_function_main,
+                "portfolio_main",
+            )
         else:
-            filtered_data = data[data[date_col].dt.month == rebalancing_month]
-            if len(filtered_data) == 0:
+            filtered_data = data.filter(
+                pl.col(date_col).dt.month() == rebalancing_month
+            )
+            if filtered_data.height == 0:
                 raise ValueError(
                     f"No observations match 'rebalancing_month' = "
                     f"{rebalancing_month}."
                 )
-            portfolio_data = filtered_data.copy()
-            portfolio_data["portfolio_secondary"] = portfolio_data.groupby(
-                date_col, group_keys=False
-            ).apply(_assign_sec, include_groups=False)
-            portfolio_data["portfolio_main"] = portfolio_data.groupby(
-                [date_col, "portfolio_secondary"], group_keys=False
-            ).apply(_assign_main, include_groups=False)
-            portfolio_data = portfolio_data[
+            portfolio_data = _assign_grouped(
+                filtered_data,
+                [date_col],
+                sv_sec,
+                breakpoint_options_secondary,
+                breakpoint_function_secondary,
+                "portfolio_secondary",
+            )
+            portfolio_data = _assign_grouped(
+                portfolio_data,
+                [date_col, "portfolio_secondary"],
+                sv_main,
+                breakpoint_options_main,
+                breakpoint_function_main,
+                "portfolio_main",
+            ).select(
                 [
                     id_col,
                     date_col,
                     "portfolio_main",
                     "portfolio_secondary",
                 ]
-            ]
+            )
             portfolio_returns = _join_rebalanced_portfolios(
                 data,
                 portfolio_data,
@@ -1456,54 +1518,55 @@ def compute_portfolio_returns(
             )
         sv_main, sv_sec = sorting_variables[0], sorting_variables[1]
 
-        def _assign_main(g):
-            return assign_portfolio(
-                g,
-                sorting_variable=sv_main,
-                breakpoint_options=breakpoint_options_main,
-                breakpoint_function=breakpoint_function_main,
-                data_options=data_options,
-            )
-
-        def _assign_sec(g):
-            return assign_portfolio(
-                g,
-                sorting_variable=sv_sec,
-                breakpoint_options=breakpoint_options_secondary,
-                breakpoint_function=breakpoint_function_secondary,
-                data_options=data_options,
-            )
-
         if rebalancing_month is None:
-            data["portfolio_secondary"] = data.groupby(
-                date_col, group_keys=False
-            ).apply(_assign_sec, include_groups=False)
-            data["portfolio_main"] = data.groupby(
-                date_col, group_keys=False
-            ).apply(_assign_main, include_groups=False)
-            portfolio_returns = data
+            data = _assign_grouped(
+                data,
+                [date_col],
+                sv_sec,
+                breakpoint_options_secondary,
+                breakpoint_function_secondary,
+                "portfolio_secondary",
+            )
+            portfolio_returns = _assign_grouped(
+                data,
+                [date_col],
+                sv_main,
+                breakpoint_options_main,
+                breakpoint_function_main,
+                "portfolio_main",
+            )
         else:
-            filtered_data = data[data[date_col].dt.month == rebalancing_month]
-            if len(filtered_data) == 0:
+            filtered_data = data.filter(
+                pl.col(date_col).dt.month() == rebalancing_month
+            )
+            if filtered_data.height == 0:
                 raise ValueError(
                     f"No observations match 'rebalancing_month' = "
                     f"{rebalancing_month}."
                 )
-            portfolio_data = filtered_data.copy()
-            portfolio_data["portfolio_secondary"] = portfolio_data.groupby(
-                date_col, group_keys=False
-            ).apply(_assign_sec, include_groups=False)
-            portfolio_data["portfolio_main"] = portfolio_data.groupby(
-                date_col, group_keys=False
-            ).apply(_assign_main, include_groups=False)
-            portfolio_data = portfolio_data[
+            portfolio_data = _assign_grouped(
+                filtered_data,
+                [date_col],
+                sv_sec,
+                breakpoint_options_secondary,
+                breakpoint_function_secondary,
+                "portfolio_secondary",
+            )
+            portfolio_data = _assign_grouped(
+                portfolio_data,
+                [date_col],
+                sv_main,
+                breakpoint_options_main,
+                breakpoint_function_main,
+                "portfolio_main",
+            ).select(
                 [
                     id_col,
                     date_col,
                     "portfolio_main",
                     "portfolio_secondary",
                 ]
-            ]
+            )
             portfolio_returns = _join_rebalanced_portfolios(
                 data,
                 portfolio_data,
@@ -1521,26 +1584,30 @@ def compute_portfolio_returns(
             min_portfolio_size,
         )
 
-    portfolio_returns = portfolio_returns[
-        portfolio_returns["portfolio"].notna()
-    ]
+    portfolio_returns = portfolio_returns.filter(
+        pl.col("portfolio").is_not_null()
+    )
 
     if rebalancing_month is not None:
-        matching_dates = [
-            d for d in all_dates if pd.Timestamp(d).month == rebalancing_month
-        ]
-        if not matching_dates:
+        matching_dates = all_dates.filter(
+            all_dates.dt.month() == rebalancing_month
+        )
+        if matching_dates.is_empty():
             raise ValueError(
                 f"No dates in data match for rebalancing month = "
                 f"{rebalancing_month}."
             )
-        first_rebalancing_date = min(matching_dates)
-        all_dates = [d for d in all_dates if d >= first_rebalancing_date]
+        first_rebalancing_date = matching_dates.min()
+        all_dates = all_dates.filter(all_dates >= first_rebalancing_date)
 
-    all_portfolios = portfolio_returns["portfolio"].dropna().unique().tolist()
-    complete_panel = pd.MultiIndex.from_product(
-        [all_portfolios, all_dates], names=["portfolio", date_col]
-    ).to_frame(index=False)
+    all_portfolios = (
+        portfolio_returns.get_column("portfolio").unique().drop_nulls().sort()
+    )
+    complete_panel = pl.DataFrame({"portfolio": all_portfolios}).join(
+        pl.DataFrame({date_col: all_dates}),
+        how="cross",
+        maintain_order="left_right",
+    )
 
     return_cols = (
         ["ret_excess_ew"]
@@ -1552,11 +1619,14 @@ def compute_portfolio_returns(
         ]
     )
 
-    portfolio_returns = complete_panel.merge(
-        portfolio_returns, on=["portfolio", date_col], how="left"
-    )[["portfolio", date_col] + return_cols]
+    portfolio_returns = complete_panel.join(
+        portfolio_returns,
+        on=["portfolio", date_col],
+        how="left",
+        maintain_order="left",
+    ).select(["portfolio", date_col] + return_cols)
 
-    n_missing = portfolio_returns["ret_excess_ew"].isna().sum()
+    n_missing = portfolio_returns.get_column("ret_excess_ew").null_count()
     if not quiet and n_missing > 0:
         warnings.warn(
             f"Returning a complete panel with {n_missing} missing "
@@ -1571,10 +1641,10 @@ def compute_portfolio_returns(
 
 
 def compute_long_short_returns(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     direction: str = "top_minus_bottom",
     data_options: dict = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Compute long-short returns.
 
     Calculates long-short returns based on the returns of portfolios.
@@ -1586,7 +1656,7 @@ def compute_long_short_returns(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Data frame containing portfolio returns. Must include columns
         for the portfolio identifier, date, and return measurements
         (as specified in 'data_options').
@@ -1604,7 +1674,7 @@ def compute_long_short_returns(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Data frame with columns for date and the computed long-short
         returns. The data frame is arranged by date and pivoted to
         have return measurement types as columns with their
@@ -1613,18 +1683,21 @@ def compute_long_short_returns(
     Examples
     --------
     ```python
+    import datetime as dt
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import (
         compute_portfolio_returns,
         compute_long_short_returns,
         breakpoint_options,
     )
     rng = np.random.default_rng(42)
-    dates = pd.date_range('2020-01-01', periods=100, freq='MS')
-    data = pd.DataFrame({
+    dates = pl.date_range(
+        dt.date(2020, 1, 1), dt.date(2028, 4, 1), '1mo', eager=True
+    )
+    data = pl.DataFrame({
         'permno': range(1, 101),
-        'date': np.repeat(dates, 1),
+        'date': dates,
         'mktcap_lag': rng.uniform(100, 1000, 100),
         'ret_excess': rng.standard_normal(100),
         'size': rng.uniform(50, 150, 100),
@@ -1649,50 +1722,55 @@ def compute_long_short_returns(
 
     ret_cols = [c for c in data.columns if ret_excess_col in c]
 
-    work = data.copy()
-    work["_min_p"] = work.groupby(date_col)[portfolio_col].transform("min")
-    work["_max_p"] = work.groupby(date_col)[portfolio_col].transform("max")
-
-    single_portfolio = work["_min_p"] == work["_max_p"]
-    is_bottom = work[portfolio_col] == work["_min_p"]
-    is_top = work[portfolio_col] == work["_max_p"]
-    work["_leg"] = pd.Series(index=work.index, dtype="object")
-    work.loc[is_bottom & ~single_portfolio, "_leg"] = "bottom"
-    work.loc[is_top & ~single_portfolio, "_leg"] = "top"
-
-    legs_only = work[work["_leg"].isin(["bottom", "top"])].copy()
-
-    all_dates = (
-        pd.Series(data[date_col].unique(), name=date_col)
-        .sort_values()
-        .reset_index(drop=True)
+    work = data.with_columns(
+        _min_p=pl.col(portfolio_col).min().over(date_col),
+        _max_p=pl.col(portfolio_col).max().over(date_col),
     )
-    result = pd.DataFrame({date_col: all_dates})
+
+    single_portfolio = pl.col("_min_p") == pl.col("_max_p")
+    work = work.with_columns(
+        pl.when(single_portfolio)
+        .then(None)
+        .when(pl.col(portfolio_col) == pl.col("_min_p"))
+        .then(pl.lit("bottom"))
+        .when(pl.col(portfolio_col) == pl.col("_max_p"))
+        .then(pl.lit("top"))
+        .otherwise(None)
+        .alias("_leg")
+    )
+
+    legs_only = work.filter(pl.col("_leg").is_in(["bottom", "top"]))
+
+    all_dates = data.get_column(date_col).unique().sort()
+    result = pl.DataFrame({date_col: all_dates})
 
     for ret_col in ret_cols:
-        pivoted = legs_only.pivot_table(
-            index=date_col,
-            columns="_leg",
-            values=ret_col,
-            aggfunc="first",
+        legs = (
+            legs_only.group_by([date_col, "_leg"], maintain_order=True)
+            .agg(pl.col(ret_col).drop_nulls().first())
+            .pivot("_leg", index=date_col, values=ret_col)
         )
         for leg in ("bottom", "top"):
-            if leg not in pivoted.columns:
-                pivoted[leg] = np.nan
+            if leg not in legs.columns:
+                legs = legs.with_columns(
+                    pl.lit(None, dtype=pl.Float64).alias(leg)
+                )
 
         if direction == "bottom_minus_top":
-            ls = pivoted["bottom"] - pivoted["top"]
+            ls = pl.col("bottom") - pl.col("top")
         else:
-            ls = pivoted["top"] - pivoted["bottom"]
+            ls = pl.col("top") - pl.col("bottom")
 
-        ls_df = ls.rename(ret_col).reset_index()
-        result = result.merge(ls_df, on=date_col, how="left")
+        ls_df = legs.select(pl.col(date_col), ls.alias(ret_col))
+        result = result.join(
+            ls_df, on=date_col, how="left", maintain_order="left"
+        )
 
     return result
 
 
 def _require_column(
-    data: pd.DataFrame, col: str, arg: str, info: str = None
+    data: pl.DataFrame, col: str, arg: str, info: str = None
 ) -> None:
     """Raise ValueError if col is not in data.columns."""
     if col not in data.columns:
@@ -1702,12 +1780,12 @@ def _require_column(
 
 
 def _filter_with_log(
-    data: pd.DataFrame, condition, label: str, quiet: bool
-) -> pd.DataFrame:
+    data: pl.DataFrame, condition, label: str, quiet: bool
+) -> pl.DataFrame:
     """Apply a boolean filter and optionally warn about dropped rows."""
-    n_before = len(data)
-    data = data[condition]
-    n_dropped = n_before - len(data)
+    n_before = data.height
+    data = data.filter(condition)
+    n_dropped = n_before - data.height
     if not quiet and n_dropped > 0:
         warnings.warn(
             f"Filter '{label}': removed {n_dropped} observation(s).",
@@ -1718,11 +1796,11 @@ def _filter_with_log(
 
 
 def filter_sorting_data(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     filter_options: dict = None,
     data_options: dict = None,
     quiet: bool = False,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Filter sorting data.
 
     Applies sample construction filters to a data frame before
@@ -1734,7 +1812,7 @@ def filter_sorting_data(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Data frame containing the stock-level panel data to be
         filtered.
     filter_options : dict, optional
@@ -1776,20 +1854,21 @@ def filter_sorting_data(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Filtered data frame, preserving the class and structure of the
         input.
 
     Examples
     --------
     ```python
-    import pandas as pd
+    import datetime as dt
+    import polars as pl
     from tidyfinance import filter_sorting_data, filter_options
-    data = pd.DataFrame({
+    data = pl.DataFrame({
         'permno': range(1, 6),
-        'date': pd.Timestamp('2020-01-01'),
+        'date': [dt.date(2020, 1, 1)] * 5,
         'siccd': [6100, 2000, 4950, 3000, 6500],
-        'prc_adj': [5, 0.5, 15, 20, 10],
+        'prc_adj': [5.0, 0.5, 15.0, 20.0, 10.0],
     })
     filter_sorting_data(
         data,
@@ -1837,14 +1916,14 @@ def filter_sorting_data(
         _require_column(data, col_siccd, "data_options['siccd']")
 
         if filter_options.get("exclude_financials"):
-            keep = data[col_siccd].isna() | ~(
-                (data[col_siccd] >= 6000) & (data[col_siccd] <= 6799)
+            keep = pl.col(col_siccd).is_null() | ~(
+                (pl.col(col_siccd) >= 6000) & (pl.col(col_siccd) <= 6799)
             )
             data = _filter_with_log(data, keep, "exclude_financials", quiet)
 
         if filter_options.get("exclude_utilities"):
-            keep = data[col_siccd].isna() | ~(
-                (data[col_siccd] >= 4900) & (data[col_siccd] <= 4999)
+            keep = pl.col(col_siccd).is_null() | ~(
+                (pl.col(col_siccd) >= 4900) & (pl.col(col_siccd) <= 4999)
             )
             data = _filter_with_log(data, keep, "exclude_utilities", quiet)
 
@@ -1852,8 +1931,8 @@ def filter_sorting_data(
     if filter_options.get("min_stock_price") is not None:
         col_price = data_options["price"]
         _require_column(data, col_price, "data_options['price']")
-        keep = data[col_price].notna() & (
-            data[col_price] >= filter_options["min_stock_price"]
+        keep = pl.col(col_price).is_not_null() & (
+            pl.col(col_price) >= filter_options["min_stock_price"]
         )
         data = _filter_with_log(data, keep, "min_stock_price", quiet)
 
@@ -1874,17 +1953,19 @@ def filter_sorting_data(
             ),
         )
 
-        n_before = len(data)
+        n_before = data.height
         size_threshold = filter_options["min_size_quantile"]
-        nyse_data = data[data[col_exchange] == "NYSE"]
-        size_cutoffs = (
-            nyse_data.groupby(col_date)[col_mktcap_lag]
-            .quantile(size_threshold)
-            .reset_index(name="_size_cutoff")
+        nyse_data = data.filter(pl.col(col_exchange) == "NYSE")
+        size_cutoffs = nyse_data.group_by(col_date, maintain_order=True).agg(
+            _size_cutoff=pl.col(col_mktcap_lag).quantile(
+                size_threshold, interpolation="linear"
+            )
         )
 
-        dates_in_data = set(data[col_date].unique())
-        dates_with_cutoff = set(size_cutoffs[col_date].unique())
+        dates_in_data = set(data.get_column(col_date).unique().to_list())
+        dates_with_cutoff = set(
+            size_cutoffs.get_column(col_date).unique().to_list()
+        )
         dates_missing_cutoff = dates_in_data - dates_with_cutoff
         if dates_missing_cutoff:
             warnings.warn(
@@ -1896,13 +1977,15 @@ def filter_sorting_data(
                 stacklevel=2,
             )
 
-        data = data.merge(size_cutoffs, on=col_date, how="inner")
-        data = data[
-            data[col_mktcap_lag].notna()
-            & (data[col_mktcap_lag] >= data["_size_cutoff"])
-        ]
-        data = data.drop(columns="_size_cutoff")
-        n_dropped = n_before - len(data)
+        data = data.join(
+            size_cutoffs, on=col_date, how="inner", maintain_order="left"
+        )
+        data = data.filter(
+            pl.col(col_mktcap_lag).is_not_null()
+            & (pl.col(col_mktcap_lag) >= pl.col("_size_cutoff"))
+        )
+        data = data.drop("_size_cutoff")
+        n_dropped = n_before - data.height
         if not quiet and n_dropped > 0:
             warnings.warn(
                 f"Filter 'min_size_quantile': removed {n_dropped} "
@@ -1915,8 +1998,8 @@ def filter_sorting_data(
     if filter_options.get("min_listing_age") is not None:
         col_listing_age = data_options["listing_age"]
         _require_column(data, col_listing_age, "data_options['listing_age']")
-        keep = data[col_listing_age].notna() & (
-            data[col_listing_age] >= filter_options["min_listing_age"]
+        keep = pl.col(col_listing_age).is_not_null() & (
+            pl.col(col_listing_age) >= filter_options["min_listing_age"]
         )
         data = _filter_with_log(data, keep, "min_listing_age", quiet)
 
@@ -1924,7 +2007,7 @@ def filter_sorting_data(
     if filter_options.get("exclude_negative_book_equity"):
         col_be = data_options["be"]
         _require_column(data, col_be, "data_options['be']")
-        keep = data[col_be].notna() & (data[col_be] > 0)
+        keep = pl.col(col_be).is_not_null() & (pl.col(col_be) > 0)
         data = _filter_with_log(
             data, keep, "exclude_negative_book_equity", quiet
         )
@@ -1933,14 +2016,14 @@ def filter_sorting_data(
     if filter_options.get("exclude_negative_earnings"):
         col_earn = data_options["earnings"]
         _require_column(data, col_earn, "data_options['earnings']")
-        keep = data[col_earn].notna() & (data[col_earn] > 0)
+        keep = pl.col(col_earn).is_not_null() & (pl.col(col_earn) > 0)
         data = _filter_with_log(data, keep, "exclude_negative_earnings", quiet)
 
     return data
 
 
 def implement_portfolio_sort(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     sorting_variables,
     sorting_method: str,
     portfolio_sort_options: dict,
@@ -1951,7 +2034,7 @@ def implement_portfolio_sort(
     cap_weight: float = 0.8,
     data_options: dict = None,
     quiet: bool = False,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Implement a portfolio sort.
 
     A convenience wrapper that combines sample construction filtering
@@ -1962,7 +2045,7 @@ def implement_portfolio_sort(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Data frame containing the stock-level panel data.
     sorting_variables : str or list of str
         One or two column names to sort portfolios on.
@@ -1989,7 +2072,7 @@ def implement_portfolio_sort(
         firms per portfolio-date; for bivariate sorts that is firms
         per main-portfolio-date summed across the secondary buckets.
         Cross-sections below the threshold have their returns set to
-        NaN. Set to 0 to deactivate the check.
+        null. Set to 0 to deactivate the check.
     cap_weight : float, default 0.8
         Quantile of the cross-sectional 'mktcap_lag' distribution at
         which market capitalizations are capped per date when computing
@@ -2005,15 +2088,16 @@ def implement_portfolio_sort(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Data frame of portfolio returns as returned by
         'compute_portfolio_returns'.
 
     Examples
     --------
     ```python
+    import datetime as dt
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import (
         implement_portfolio_sort,
         portfolio_sort_options,
@@ -2021,10 +2105,12 @@ def implement_portfolio_sort(
         breakpoint_options,
     )
     rng = np.random.default_rng(123)
-    dates = pd.date_range('2020-01-01', periods=100, freq='MS')
-    data = pd.DataFrame({
+    dates = pl.date_range(
+        dt.date(2020, 1, 1), dt.date(2028, 4, 1), '1mo', eager=True
+    )
+    data = pl.DataFrame({
         'permno': range(1, 501),
-        'date': np.repeat(dates, 5),
+        'date': dates.to_numpy().repeat(5),
         'mktcap_lag': rng.uniform(100, 1000, 500),
         'ret_excess': rng.standard_normal(500),
         'prc_adj': rng.uniform(0.5, 50, 500),

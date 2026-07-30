@@ -5,15 +5,22 @@ import sys
 from unittest.mock import patch
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 )
 
-from tidyfinance.download_pseudo import _download_data_pseudo_ccm_links, _download_data_pseudo_compustat, _download_data_pseudo_crsp, _simulate_pseudo_data, _simulate_pseudo_identifiers
 from tidyfinance.download import download_data  # noqa: E402
+from tidyfinance.download_pseudo import (  # noqa: E402
+    _download_data_pseudo_ccm_links,
+    _download_data_pseudo_compustat,
+    _download_data_pseudo_crsp,
+    _simulate_pseudo_data,
+    _simulate_pseudo_identifiers,
+)
 
 # %% router
 
@@ -46,12 +53,12 @@ def test_simulate_pseudo_data_dispatches_to_crsp():
     with (
         patch(
             "tidyfinance.download_pseudo._download_data_pseudo_crsp",
-            return_value=pd.DataFrame({"kind": ["crsp"]}),
+            return_value=pl.DataFrame({"kind": ["crsp"]}),
         ),
         pytest.warns(UserWarning),
     ):
         out = _simulate_pseudo_data("crsp_monthly", n_assets=2)
-    assert out["kind"].iloc[0] == "crsp"
+    assert out["kind"][0] == "crsp"
 
 
 def test_simulate_pseudo_data_dispatches_to_compustat():
@@ -59,12 +66,12 @@ def test_simulate_pseudo_data_dispatches_to_compustat():
     with (
         patch(
             "tidyfinance.download_pseudo._download_data_pseudo_compustat",
-            return_value=pd.DataFrame({"kind": ["compustat"]}),
+            return_value=pl.DataFrame({"kind": ["compustat"]}),
         ),
         pytest.warns(UserWarning),
     ):
         out = _simulate_pseudo_data("compustat_annual", n_assets=2)
-    assert out["kind"].iloc[0] == "compustat"
+    assert out["kind"][0] == "compustat"
 
 
 def test_simulate_pseudo_data_dispatches_to_ccm():
@@ -72,19 +79,19 @@ def test_simulate_pseudo_data_dispatches_to_ccm():
     with (
         patch(
             "tidyfinance.download_pseudo._download_data_pseudo_ccm_links",
-            return_value=pd.DataFrame({"kind": ["ccm"]}),
+            return_value=pl.DataFrame({"kind": ["ccm"]}),
         ),
         pytest.warns(UserWarning),
     ):
         out = _simulate_pseudo_data("ccm_links", n_assets=2)
-    assert out["kind"].iloc[0] == "ccm"
+    assert out["kind"][0] == "ccm"
 
 
 def test_download_data_routes_pseudo():
     """download_data(domain='Pseudo Data', ...) reaches _simulate_pseudo_data."""
     with patch(
         "tidyfinance.download._simulate_pseudo_data",
-        return_value=pd.DataFrame({"sentinel": [1]}),
+        return_value=pl.DataFrame({"sentinel": [1]}),
     ):
         out = download_data(
             domain="Pseudo Data",
@@ -92,7 +99,7 @@ def test_download_data_routes_pseudo():
             start_date="2020-01-01",
             end_date="2020-06-30",
         )
-    assert out["sentinel"].iloc[0] == 1
+    assert out["sentinel"][0] == 1
 
 
 # %% pseudo CRSP
@@ -125,7 +132,7 @@ def test_pseudo_crsp_monthly_schema():
     }
     assert expected.issubset(set(crsp.columns))
     assert "gvkey" not in crsp.columns
-    assert len(crsp) == 5 * 6
+    assert crsp.height == 5 * 6
 
 
 def test_pseudo_crsp_add_ccm_links_appends_gvkey():
@@ -152,9 +159,9 @@ def test_pseudo_crsp_daily_schema_weekdays_only():
         n_assets=4,
         seed=1234,
     )
-    assert list(crsp_daily.columns) == ["permno", "date", "ret", "ret_excess"]
-    assert len(crsp_daily) == 4 * 23  # 23 weekdays in Jan 2020
-    assert (crsp_daily["date"].dt.weekday < 5).all()
+    assert crsp_daily.columns == ["permno", "date", "ret", "ret_excess"]
+    assert crsp_daily.height == 4 * 23  # 23 weekdays in Jan 2020
+    assert (crsp_daily["date"].dt.weekday() <= 5).all()
 
 
 def test_pseudo_crsp_validates_dataset():
@@ -216,7 +223,7 @@ def test_pseudo_compustat_annual_schema():
         "at_lag",
     }
     assert expected.issubset(set(comp.columns))
-    assert len(comp) == 5 * 5
+    assert comp.height == 5 * 5
 
 
 def test_pseudo_compustat_quarterly_schema():
@@ -228,10 +235,10 @@ def test_pseudo_compustat_quarterly_schema():
         n_assets=5,
         seed=1234,
     )
-    assert list(compq.columns) == ["gvkey", "date", "datadate", "atq", "ceqq"]
-    assert len(compq) == 5 * 4
+    assert compq.columns == ["gvkey", "date", "datadate", "atq", "ceqq"]
+    assert compq.height == 5 * 4
     month_day = compq["datadate"].dt.strftime("%m-%d")
-    assert month_day.isin(["03-31", "06-30", "09-30", "12-31"]).all()
+    assert month_day.is_in(["03-31", "06-30", "09-30", "12-31"]).all()
 
 
 def test_pseudo_compustat_validates_dataset():
@@ -274,8 +281,8 @@ def test_pseudo_compustat_additional_columns_quarterly():
 def test_pseudo_ccm_links_full_universe():
     """CCM links cover the full identifier universe."""
     ccm = _download_data_pseudo_ccm_links(n_assets=10, seed=1234)
-    assert len(ccm) == 10
-    assert list(ccm.columns) == ["permno", "gvkey", "linkdt", "linkenddt"]
+    assert ccm.height == 10
+    assert ccm.columns == ["permno", "gvkey", "linkdt", "linkenddt"]
 
 
 # %% determinism + cross-dataset consistency
@@ -297,7 +304,7 @@ def test_pseudo_output_is_deterministic_in_seed():
         n_assets=5,
         seed=1234,
     )
-    pd.testing.assert_frame_equal(a1, a2)
+    assert_frame_equal(a1, a2)
 
     b1 = _download_data_pseudo_crsp(
         "crsp_monthly",

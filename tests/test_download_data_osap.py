@@ -1,10 +1,11 @@
 """Tests for download_data_osap."""
 
+import datetime as dt
 import os
 import sys
 from unittest.mock import patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -17,54 +18,54 @@ from tidyfinance.download_open_source import _download_data_osap  # noqa: E402
 
 def test_downloads_and_processes_all_rows():
     """Test downloads and processes all rows."""
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "date": ["2020-01-31", "2020-02-29"],
             "LongName": [1, 2],
         }
     )
-    with patch("tidyfinance.download_open_source.pd.read_csv", return_value=raw):
+    with patch("tidyfinance.download_open_source._fetch_csv", return_value=raw):
         result = _download_data_osap(sheet_id="abc")
 
-    assert isinstance(result, pd.DataFrame)
-    assert list(result.columns) == ["date", "long_name"]
+    assert isinstance(result, pl.DataFrame)
+    assert result.columns == ["date", "long_name"]
     # Dates are aligned to the beginning of the month.
-    assert list(result["date"]) == [
-        pd.Timestamp("2020-01-01"),
-        pd.Timestamp("2020-02-01"),
+    assert result["date"].to_list() == [
+        dt.date(2020, 1, 1),
+        dt.date(2020, 2, 1),
     ]
     # Percentage returns are scaled to numeric (decimal) values.
-    assert list(result["long_name"]) == [0.01, 0.02]
+    assert result["long_name"].to_list() == [0.01, 0.02]
 
 
 def test_filters_rows_when_both_dates_are_supplied():
     """Test filters rows when both dates are supplied."""
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "date": ["2020-01-31", "2020-02-29", "2020-03-31"],
             "value": [1, 2, 3],
         }
     )
-    with patch("tidyfinance.download_open_source.pd.read_csv", return_value=raw):
+    with patch("tidyfinance.download_open_source._fetch_csv", return_value=raw):
         result = _download_data_osap(
             start_date="2020-02-01", end_date="2020-02-28"
         )
 
     assert len(result) == 1
-    assert result["date"].iloc[0] == pd.Timestamp("2020-02-01")
-    assert result["value"].iloc[0] == 0.02
+    assert result["date"][0] == dt.date(2020, 2, 1)
+    assert result["value"][0] == 0.02
 
 
 def test_returns_empty_dataframe_after_download_failure():
     """Test returns empty dataframe after download failure."""
     with patch(
-        "tidyfinance.download_open_source.pd.read_csv",
+        "tidyfinance.download_open_source._fetch_csv",
         side_effect=Exception("download failure"),
     ):
         with pytest.warns(UserWarning, match="Returning an empty dataset"):
             result = _download_data_osap()
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
 
 

@@ -8,10 +8,10 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
-import pandas as pd
+import polars as pl
 from curl_cffi import requests
 
-from ._internal import _validate_dates
+from ._internal import _get_random_user_agent, _parse_date, _validate_dates
 
 _SUPPORTED_DATASETS_HF = (
     "high_frequency_sp500",
@@ -42,11 +42,66 @@ _FACTOR_LIBRARY_SUPPORTED_FILTERS = (
 _hf_session = requests.Session()
 
 
+def _read_parquet_url(url: str) -> pl.DataFrame:
+    """
+    Fetch a parquet file over HTTPS and parse it with polars.
+
+    Single-shot seam used wherever the pandas implementation called
+    'pd.read_parquet(url)' directly. Tests patch this function.
+
+    Parameters
+    ----------
+    url : str
+        Fully qualified URL of the parquet file.
+
+    Returns
+    -------
+    pl.DataFrame
+        The parsed parquet content.
+    """
+    response = requests.get(
+        url,
+        headers={"User-Agent": _get_random_user_agent()},
+        impersonate="chrome",
+        timeout=120,
+    )
+    response.raise_for_status()
+    return pl.read_parquet(io.BytesIO(response.content))
+
+
+def _cast_date_column(data: pl.DataFrame, column: str = "date") -> pl.DataFrame:
+    """
+    Normalize a calendar-date column to 'pl.Date'.
+
+    Handles columns stored as 'pl.Date', (tz-aware) 'pl.Datetime', or
+    ISO-formatted strings so date comparisons work regardless of how
+    the parquet file encoded the column.
+
+    Parameters
+    ----------
+    data : pl.DataFrame
+        Frame containing 'column'.
+    column : str, default 'date'
+        Name of the column to cast.
+
+    Returns
+    -------
+    pl.DataFrame
+        Frame with 'column' cast to 'pl.Date'.
+    """
+    dtype = data.schema[column]
+    if dtype == pl.Date:
+        return data
+    if dtype == pl.String:
+        return data.with_columns(pl.col(column).str.to_date())
+    return data.with_columns(pl.col(column).cast(pl.Date))
+
+
 def _download_data_risk_free(
     start_date: str = None,
     end_date: str = None,
     frequency: str = "monthly",
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download risk-free rate data.
 
@@ -100,7 +155,7 @@ def _download_data_risk_free(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with two columns:
 
         - 'date': the date of the observation.
@@ -127,7 +182,7 @@ def _download_data_risk_free(
     )
 
     try:
-        risk_free_data = pd.read_parquet(url)
+        risk_free_data = _read_parquet_url(url)
 
     except Exception as e:
         raise RuntimeError(
@@ -135,13 +190,12 @@ def _download_data_risk_free(
             f"URL attempted: {url}"
         ) from e
 
-    risk_free_data["date"] = pd.to_datetime(risk_free_data["date"])
+    risk_free_data = _cast_date_column(risk_free_data)
 
     if start_date is not None:
-        risk_free_data = risk_free_data[
-            (risk_free_data["date"] >= start_date)
-            & (risk_free_data["date"] <= end_date)
-        ].reset_index(drop=True)
+        risk_free_data = risk_free_data.filter(
+            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
+        )
 
     return risk_free_data
 
@@ -149,7 +203,9 @@ def _download_data_risk_free(
 # %% hugging face functions for tidy finance data
 
 
-def _get_available_huggingface_files(organization: str, dataset: str) -> pd.DataFrame:
+def _get_available_huggingface_files(
+    organization: str, dataset: str
+) -> pl.DataFrame:
     """
     List parquet files in a Hugging Face dataset.
 
@@ -169,13 +225,15 @@ def _get_available_huggingface_files(organization: str, dataset: str) -> pd.Data
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with columns 'path' (str) and 'size' (int).
 
     Examples
     --------
     ```python
-    from tidyfinance.data_download import _get_available_huggingface_files
+    from tidyfinance.download_tidy_finance import (
+        _get_available_huggingface_files,
+    )
     _get_available_huggingface_files('voigtstefan', 'sp500')
     ```
     """
@@ -183,7 +241,8 @@ def _get_available_huggingface_files(organization: str, dataset: str) -> pd.Data
         f"https://huggingface.co/api/datasets/{organization}/{dataset}"
         "/tree/main?recursive=1"
     )
-    rows = []
+    paths = []
+    sizes = []
     next_url = api_url
 
     while next_url:
@@ -193,15 +252,19 @@ def _get_available_huggingface_files(organization: str, dataset: str) -> pd.Data
             is_file = entry.get("type") == "file"
             is_parquet = entry["path"].endswith(".parquet")
             if is_file and is_parquet:
-                rows.append({"path": entry["path"], "size": entry.get("size")})
+                paths.append(entry["path"])
+                sizes.append(entry.get("size"))
         link = resp.headers.get("Link", "")
         match = re.search(r'<([^>]+)>;\s*rel="next"', link)
         next_url = match.group(1) if match else None
 
-    return pd.DataFrame(rows, columns=["path", "size"])
+    return pl.DataFrame(
+        {"path": paths, "size": sizes},
+        schema={"path": pl.String, "size": pl.Int64},
+    )
 
 
-def _download_factor_library_grid() -> pd.DataFrame:
+def _download_factor_library_grid() -> pl.DataFrame:
     """
     Download the factor library grid from Hugging Face.
 
@@ -215,7 +278,7 @@ def _download_factor_library_grid() -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with one row per portfolio construction in the
         factor library, including the integer 'id' column used by
         '_download_factor_library_ids'.
@@ -229,22 +292,26 @@ def _download_factor_library_grid() -> pd.DataFrame:
     Examples
     --------
     ```python
-    from tidyfinance.data_download import _download_factor_library_grid
+    from tidyfinance.download_tidy_finance import (
+        _download_factor_library_grid,
+    )
     _download_factor_library_grid()
     ```
     """
-    available = _get_available_huggingface_files("tidy-finance", "factor-library-grid")
-    if available.empty or "path" not in available.columns:
+    available = _get_available_huggingface_files(
+        "tidy-finance", "factor-library-grid"
+    )
+    if available.is_empty() or "path" not in available.columns:
         raise ValueError(
             "No parquet files were found in the Hugging Face dataset repo "
             "'tidy-finance/factor-library-grid'."
         )
-    grid_path = available["path"].iloc[0]
+    grid_path = available["path"][0]
     grid_url = (
         "https://huggingface.co/datasets/tidy-finance"
         f"/factor-library-grid/resolve/main/{grid_path}"
     )
-    return pd.read_parquet(grid_url)
+    return _read_parquet_url(grid_url)
 
 
 def _filter_factor_library_grid(fill_all: bool = False, **filters) -> list:
@@ -324,19 +391,17 @@ def _filter_factor_library_grid(fill_all: bool = False, **filters) -> list:
             if col not in filters and col not in unrestricted:
                 filters[col] = default
 
-    grid = _download_factor_library_grid().assign(
-        sorting_variable=lambda x: x["sorting_variable"].str.replace(
-            r"^sv_", "", regex=True
-        )
+    grid = _download_factor_library_grid().with_columns(
+        pl.col("sorting_variable").str.replace(r"^sv_", "")
     )
 
     for col, value in filters.items():
         values = value if isinstance(value, (list, tuple)) else [value]
         if values == [None]:
-            grid = grid.loc[grid[col].isna()]
+            grid = grid.filter(pl.col(col).is_null())
         else:
-            grid = grid.loc[grid[col].isin(values)]
-    return grid["id"].tolist()
+            grid = grid.filter(pl.col(col).is_in(values))
+    return grid["id"].to_list()
 
 
 def _fetch_parquet_url(url, retries=5, backoff=2.0):
@@ -350,7 +415,7 @@ def _fetch_parquet_url(url, retries=5, backoff=2.0):
         try:
             r = _hf_session.get(url, headers=headers, timeout=120)
             r.raise_for_status()
-            return pd.read_parquet(io.BytesIO(r.content))
+            return pl.read_parquet(io.BytesIO(r.content))
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
@@ -360,7 +425,7 @@ def _fetch_parquet_url(url, retries=5, backoff=2.0):
     ) from last_err
 
 
-def _download_factor_library_ids(ids: list) -> pd.DataFrame:
+def _download_factor_library_ids(ids: list) -> pl.DataFrame:
     """
     Download factor library returns for a vector of portfolio IDs.
 
@@ -393,7 +458,7 @@ def _download_factor_library_ids(ids: list) -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame of portfolio returns with the grid metadata
         columns for the requested IDs appended.
 
@@ -406,7 +471,9 @@ def _download_factor_library_ids(ids: list) -> pd.DataFrame:
     Examples
     --------
     ```python
-    from tidyfinance.data_download import _download_factor_library_ids
+    from tidyfinance.download_tidy_finance import (
+        _download_factor_library_ids,
+    )
     _download_factor_library_ids([1, 2, 3])
     ```
     """
@@ -419,35 +486,36 @@ def _download_factor_library_ids(ids: list) -> pd.DataFrame:
     organization = "tidy-finance"
     dataset_name = "factor-library"
 
-    path_pattern = re.compile(r"sorting_variable=([^/]+)/sorting_variable_lag=([^/]+)/")
-    available_files = _get_available_huggingface_files(organization, dataset_name)
-
-    def _extract_keys(path: str) -> tuple:
-        m = path_pattern.search(path)
-        return (m.group(1), m.group(2)) if m else (None, None)
-
-    available_files[["sorting_variable", "sorting_variable_lag"]] = pd.DataFrame(
-        available_files["path"].apply(_extract_keys).tolist(),
-        index=available_files.index,
+    path_pattern = (
+        r"sorting_variable=([^/]+)/sorting_variable_lag=([^/]+)/"
+    )
+    available_files = _get_available_huggingface_files(
+        organization, dataset_name
+    )
+    available_files = available_files.with_columns(
+        sorting_variable=pl.col("path").str.extract(path_pattern, 1),
+        sorting_variable_lag=pl.col("path").str.extract(path_pattern, 2),
     )
 
-    grid = _download_factor_library_grid().assign(
-        sorting_variable=lambda x: x["sorting_variable"].str.replace(
-            r"^sv_", "", regex=True
-        )
+    grid = _download_factor_library_grid().with_columns(
+        pl.col("sorting_variable").str.replace(r"^sv_", "")
     )
 
-    id_grid = grid.loc[grid["id"].isin(ids)].merge(
-        available_files[["sorting_variable", "sorting_variable_lag", "path"]],
+    id_grid = grid.filter(pl.col("id").is_in(ids)).join(
+        available_files.select(
+            "sorting_variable", "sorting_variable_lag", "path"
+        ),
         on=["sorting_variable", "sorting_variable_lag"],
         how="left",
+        maintain_order="left",
     )
 
-    missing = id_grid.loc[id_grid["path"].isna()]
-    if not missing.empty:
+    missing = id_grid.filter(pl.col("path").is_null())
+    if not missing.is_empty():
         missing_keys = [
-            f"id={row.id} ({row.sorting_variable} / {row.sorting_variable_lag})"
-            for row in missing.itertuples()
+            f"id={row['id']} "
+            f"({row['sorting_variable']} / {row['sorting_variable_lag']})"
+            for row in missing.iter_rows(named=True)
         ]
         raise ValueError(
             f"No parquet file found for {len(missing_keys)} portfolio ID(s): "
@@ -455,7 +523,9 @@ def _download_factor_library_ids(ids: list) -> pd.DataFrame:
             "sorting_variable_lag values exist in the factor library."
         )
 
-    unique_paths = id_grid["path"].dropna().unique()
+    unique_paths = (
+        id_grid["path"].drop_nulls().unique(maintain_order=True).to_list()
+    )
 
     def _make_url(p):
         return (
@@ -464,15 +534,23 @@ def _download_factor_library_ids(ids: list) -> pd.DataFrame:
         )
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        frames = list(ex.map(_fetch_parquet_url, [_make_url(p) for p in unique_paths]))
+        frames = list(
+            ex.map(_fetch_parquet_url, [_make_url(p) for p in unique_paths])
+        )
 
-    returns = pd.concat(frames, ignore_index=True)
+    if not frames:
+        raise ValueError("No objects to concatenate")
+
+    returns = pl.concat(frames, how="diagonal_relaxed")
 
     meta_cols = [c for c in id_grid.columns if c not in ("path", "size")]
-    return returns.merge(
-        id_grid[meta_cols].drop_duplicates("id"),
+    return returns.join(
+        id_grid.select(meta_cols).unique(
+            subset="id", keep="first", maintain_order=True
+        ),
         on="id",
         how="inner",
+        maintain_order="left",
     )
 
 
@@ -482,7 +560,7 @@ def _download_data_huggingface_factor_library(
     start_date: str = None,
     end_date: str = None,
     **filters,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download factor library data from Hugging Face.
 
@@ -511,7 +589,7 @@ def _download_data_huggingface_factor_library(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Portfolio returns with grid metadata columns appended.
 
     Raises
@@ -528,27 +606,16 @@ def _download_data_huggingface_factor_library(
         resolved_ids = _filter_factor_library_grid(fill_all=fill_all, **filters)
         result = _download_factor_library_ids(resolved_ids)
 
-    # Normalize the date column to proper datetime64 so comparisons
-    # work regardless of whether the parquet stored dates as
-    # datetime.date, pd.Timestamp, or tz-aware datetime.
+    # Normalize the date column to pl.Date so comparisons work
+    # regardless of whether the parquet stored dates as date,
+    # datetime, tz-aware datetime, or string.
     if start_date is not None or end_date is not None:
-        result = result.copy()
-        result["date"] = pd.to_datetime(result["date"])
-        if getattr(result["date"].dt, "tz", None) is not None:
-            result["date"] = result["date"].dt.tz_localize(None)
+        result = _cast_date_column(result)
 
     if start_date is not None:
-        start_ts = pd.to_datetime(start_date)
-        if getattr(start_ts, "tz", None) is not None:
-            start_ts = start_ts.tz_localize(None)
-        result = result[result["date"] >= start_ts]
+        result = result.filter(pl.col("date") >= _parse_date(start_date))
     if end_date is not None:
-        end_ts = pd.to_datetime(end_date)
-        if getattr(end_ts, "tz", None) is not None:
-            end_ts = end_ts.tz_localize(None)
-        result = result[result["date"] <= end_ts]
-    if start_date is not None or end_date is not None:
-        result = result.reset_index(drop=True)
+        result = result.filter(pl.col("date") <= _parse_date(end_date))
 
     return result
 
@@ -559,7 +626,7 @@ def _download_data_huggingface(
     end_date: str | date = None,
     type: str = None,
     **kwargs,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download data from a Hugging Face dataset.
 
@@ -657,7 +724,7 @@ def _download_data_huggingface(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with the downloaded data. For
         'high_frequency_sp500', contains 5-second aggregated order-book
         snapshots filtered to the requested date range. For
@@ -673,7 +740,9 @@ def _download_data_huggingface(
     Examples
     --------
     ```python
-    from tidyfinance.data_download import _download_data_huggingface
+    from tidyfinance.download_tidy_finance import (
+        _download_data_huggingface,
+    )
     _download_data_huggingface(
         'high_frequency_sp500', '2007-07-26', '2007-07-27'
     )
@@ -734,32 +803,37 @@ def _download_data_huggingface(
         if end_date is None:
             end_date = "2007-07-27"
 
-        date_pattern = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
-        available_files = _get_available_huggingface_files(organization, dataset_name)
-        available_files["date"] = pd.to_datetime(
-            available_files["path"].str.extract(date_pattern, expand=False),
-            format="%Y-%m-%d",
-        ).dt.date
-
-        requested_dates = set(
-            pd.date_range(start=str(start_date), end=str(end_date), freq="D").date
+        available_files = _get_available_huggingface_files(
+            organization, dataset_name
         )
-        files_to_download = available_files.loc[
-            available_files["date"].isin(requested_dates)
-        ]
+        available_files = available_files.with_columns(
+            date=pl.col("path")
+            .str.extract(r"date=(\d{4}-\d{2}-\d{2})", 1)
+            .str.to_date()
+        )
 
-        if files_to_download.empty:
-            return pd.DataFrame()
+        requested_dates = pl.date_range(
+            _parse_date(start_date),
+            _parse_date(end_date),
+            interval="1d",
+            eager=True,
+        )
+        files_to_download = available_files.filter(
+            pl.col("date").is_in(requested_dates)
+        )
 
-        return pd.concat(
+        if files_to_download.is_empty():
+            return pl.DataFrame()
+
+        return pl.concat(
             [
-                pd.read_parquet(
+                _read_parquet_url(
                     f"https://huggingface.co/datasets/{organization}"
                     f"/{dataset_name}/resolve/main/{path}"
                 )
                 for path in files_to_download["path"]
             ],
-            ignore_index=True,
+            how="diagonal_relaxed",
         )
 
     if dataset == "factor_library_grid":

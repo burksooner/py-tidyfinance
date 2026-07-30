@@ -4,7 +4,7 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -15,7 +15,7 @@ from tidyfinance.download_open_source import _download_data_constituents  # noqa
 
 
 def _supported_indexes_df(index="DAX"):
-    return pd.DataFrame({"index": [index], "url": ["url"], "skip": [0]})
+    return pl.DataFrame({"index": [index], "url": ["url"], "skip": [0]})
 
 
 def test_unsupported_indexes_fail():
@@ -64,7 +64,8 @@ def test_non_200_responses_fail():
             return_value="ua",
         ),
         patch(
-            "tidyfinance.download_open_source.requests.get", return_value=response_mock
+            "tidyfinance.download_open_source.requests.get",
+            return_value=response_mock,
         ),
     ):
         with pytest.raises(ValueError, match="Failed to download data"):
@@ -97,12 +98,13 @@ def test_german_csv_layout_is_parsed_and_cleaned():
             return_value="ua",
         ),
         patch(
-            "tidyfinance.download_open_source.requests.get", return_value=response_mock
+            "tidyfinance.download_open_source.requests.get",
+            return_value=response_mock,
         ),
     ):
         out = _download_data_constituents("DAX")
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     assert list(out["symbol"]) == ["ABC.DE"]
     assert list(out["name"]) == ["Alpha AG"]
 
@@ -166,15 +168,16 @@ def test_asset_class_layout_covers_exchanges_and_symbol_rules():
             return_value="ua",
         ),
         patch(
-            "tidyfinance.download_open_source.requests.get", return_value=response_mock
+            "tidyfinance.download_open_source.requests.get",
+            return_value=response_mock,
         ),
     ):
         out = _download_data_constituents("MSCI World")
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     # 25 exchange rows survive; symbol uniqueness mirrors R assertions
     assert len(out) == len(exchanges)
-    symbols = set(out["symbol"].tolist())
+    symbols = set(out["symbol"].to_list())
     for expected in [
         "SYM2.BE",
         "SYM3.MI",
@@ -217,7 +220,7 @@ def test_download_request_pipeline_is_executed():
     with (
         patch(
             "tidyfinance.download_open_source.list_supported_indexes",
-            return_value=pd.DataFrame(
+            return_value=pl.DataFrame(
                 {"index": ["S&P 500"], "url": ["mock-url"], "skip": [0]}
             ),
         ),
@@ -226,12 +229,13 @@ def test_download_request_pipeline_is_executed():
             return_value="test-agent",
         ),
         patch(
-            "tidyfinance.download_open_source.requests.get", return_value=response_mock
+            "tidyfinance.download_open_source.requests.get",
+            return_value=response_mock,
         ) as mock_get,
     ):
         out = _download_data_constituents("S&P 500")
 
-    assert "AAPL" in out["symbol"].tolist()
+    assert "AAPL" in out["symbol"].to_list()
     mock_get.assert_called()
 
 

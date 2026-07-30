@@ -1,19 +1,61 @@
 """WRDS connection and downloads for tidyfinance."""
 
+import datetime as dt
+import math
 import os
 import re
 import warnings
 
-import numpy as np
-import pandas as pd
+import polars as pl
 from dotenv import dotenv_values, load_dotenv, set_key
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import URL, create_engine
 
 from ._internal import _validate_dates
 from .download_tidy_finance import _download_data_risk_free
-from .supported_datasets import (_check_supported_dataset_wrds,
-                                 _check_supported_dataset_wrds_crsp,
-                                 _is_legacy_type_wrds)
+from .supported_datasets import (
+    _check_supported_dataset_wrds,
+    _check_supported_dataset_wrds_crsp,
+    _is_legacy_type_wrds,
+)
+
+
+def _read_sql(query, con) -> pl.DataFrame:
+    """Run a SQL query against an open WRDS connection.
+
+    Single seam for all WRDS SQL reads so tests can patch it and
+    return polars fixtures.
+
+    Parameters
+    ----------
+    query : str
+        The SQL query to execute.
+    con : object
+        An open connection, e.g. from 'get_wrds_connection'.
+
+    Returns
+    -------
+    pl.DataFrame
+        The query result.
+    """
+    return pl.read_database(query, con, infer_schema_length=None)
+
+
+def _cast_date_columns(df: pl.DataFrame, columns) -> pl.DataFrame:
+    """Cast the given columns to 'pl.Date' where present.
+
+    Real Postgres 'date' columns already arrive as 'pl.Date'; this
+    normalizes datetime-typed inputs (e.g. test fixtures).
+    """
+    exprs = [pl.col(c).cast(pl.Date) for c in columns if c in df.columns]
+    return df.with_columns(exprs) if exprs else df
+
+
+def _cast_columns(df: pl.DataFrame, dtypes: dict) -> pl.DataFrame:
+    """Cast columns to the given dtypes where present."""
+    exprs = [
+        pl.col(c).cast(dtype) for c, dtype in dtypes.items() if c in df.columns
+    ]
+    return df.with_columns(exprs) if exprs else df
 
 
 def _download_data_wrds(
@@ -22,7 +64,7 @@ def _download_data_wrds(
     end_date: str = None,
     type: str = None,
     **kwargs,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download data from WRDS.
 
@@ -56,7 +98,7 @@ def _download_data_wrds(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing the requested data, with the structure
         and contents depending on the specified 'dataset'.
 
@@ -117,6 +159,116 @@ def _download_data_wrds(
         raise ValueError(f"Unsupported WRDS dataset: {dataset!r}.")
 
 
+def _listing_age_expr() -> pl.Expr:
+    """Months between 'date' and 'first_crsp_date', clipped at 0."""
+    return (
+        (
+            (pl.col("date").dt.year() - pl.col("first_crsp_date").dt.year())
+            * 12
+            + (pl.col("date").dt.month() - pl.col("first_crsp_date").dt.month())
+            - (
+                pl.col("date").dt.day() < pl.col("first_crsp_date").dt.day()
+            ).cast(pl.Int32)
+        )
+        .clip(lower_bound=0)
+        .alias("listing_age")
+    )
+
+
+def _exchange_expr_v2() -> pl.Expr:
+    """Vectorized equivalent of '_assign_exchange' on 'primaryexch'."""
+    return (
+        pl.when(pl.col("primaryexch") == "N")
+        .then(pl.lit("NYSE"))
+        .when(pl.col("primaryexch") == "A")
+        .then(pl.lit("AMEX"))
+        .when(pl.col("primaryexch") == "Q")
+        .then(pl.lit("NASDAQ"))
+        .otherwise(pl.lit("Other"))
+        .alias("exchange")
+    )
+
+
+def _exchange_expr_v1() -> pl.Expr:
+    """Map legacy numeric 'exchcd' codes to exchange labels."""
+    return (
+        pl.when(pl.col("exchcd").is_in([1, 31]))
+        .then(pl.lit("NYSE"))
+        .when(pl.col("exchcd").is_in([2, 32]))
+        .then(pl.lit("AMEX"))
+        .when(pl.col("exchcd").is_in([3, 33]))
+        .then(pl.lit("NASDAQ"))
+        .otherwise(pl.lit("Other"))
+        .alias("exchange")
+    )
+
+
+def _industry_expr(siccd: pl.Expr) -> pl.Expr:
+    """Vectorized equivalent of '_assign_industry' on a SIC code."""
+    return (
+        pl.when(siccd.is_between(1, 999))
+        .then(pl.lit("Agriculture"))
+        .when(siccd.is_between(1000, 1499))
+        .then(pl.lit("Mining"))
+        .when(siccd.is_between(1500, 1799))
+        .then(pl.lit("Construction"))
+        .when(siccd.is_between(2000, 3999))
+        .then(pl.lit("Manufacturing"))
+        .when(siccd.is_between(4000, 4899))
+        .then(pl.lit("Transportation"))
+        .when(siccd.is_between(4900, 4999))
+        .then(pl.lit("Utilities"))
+        .when(siccd.is_between(5000, 5199))
+        .then(pl.lit("Wholesale"))
+        .when(siccd.is_between(5200, 5999))
+        .then(pl.lit("Retail"))
+        .when(siccd.is_between(6000, 6799))
+        .then(pl.lit("Finance"))
+        .when(siccd.is_between(7000, 8999))
+        .then(pl.lit("Services"))
+        .when(siccd.is_between(9000, 9999))
+        .then(pl.lit("Public"))
+        .otherwise(pl.lit("Missing"))
+        .alias("industry")
+    )
+
+
+def _zero_to_null(name: str) -> pl.Expr:
+    """Replace exact zeros in a column with null."""
+    return (
+        pl.when(pl.col(name) == 0)
+        .then(None)
+        .otherwise(pl.col(name))
+        .alias(name)
+    )
+
+
+def _inf_to_null(expr: pl.Expr) -> pl.Expr:
+    """Replace +/-inf in a float expression with null."""
+    return pl.when(expr.is_infinite()).then(None).otherwise(expr)
+
+
+def _gao_ritter_vol_adj(nasdaq_cond: pl.Expr) -> pl.Expr:
+    """Gao and Ritter (2010) NASDAQ volume adjustment."""
+    gr_date_1 = dt.date(2001, 2, 1)
+    gr_date_2 = dt.date(2002, 1, 1)
+    gr_date_3 = dt.date(2004, 1, 1)
+    vol = pl.col("vol")
+    date = pl.col("date")
+    return (
+        pl.when(nasdaq_cond & (date < gr_date_1))
+        .then(vol / 2.0)
+        .when(nasdaq_cond & (date >= gr_date_1) & (date < gr_date_2))
+        .then(vol / 1.8)
+        .when(nasdaq_cond & (date >= gr_date_2) & (date < gr_date_3))
+        .then(vol / 1.6)
+        .when(nasdaq_cond & (date >= gr_date_3))
+        .then(vol / 1.0)
+        .otherwise(vol)
+        .alias("vol_adj")
+    )
+
+
 def _download_data_wrds_crsp(
     dataset: str = None,
     start_date: str = None,
@@ -127,7 +279,7 @@ def _download_data_wrds_crsp(
     additional_columns: list = None,
     add_ccm_links: bool = False,
     adjust_volume: bool = False,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download data from WRDS CRSP.
 
@@ -186,7 +338,7 @@ def _download_data_wrds_crsp(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing CRSP stock returns, adjusted for
         delistings, along with calculated market capitalization and
         excess returns over the risk-free rate. The structure of the
@@ -247,7 +399,11 @@ def _download_data_wrds_crsp(
     if version not in ["v1", "v2"]:
         raise ValueError("version must be 'v1' or 'v2'.")
 
-    if version == "v1" and pd.Timestamp(end_date) > pd.Timestamp("2024-12-31"):
+    if (
+        version == "v1"
+        and end_date is not None
+        and end_date > dt.date(2024, 12, 31)
+    ):
         raise ValueError(
             "end_date must not be later than December 2024 for "
             "version='v1'. CRSP discontinued the legacy version at the "
@@ -277,7 +433,7 @@ def _download_data_wrds_crsp(
         ", ".join(additional_columns_list) if additional_columns_list else ""
     )
 
-    crsp_data = pd.DataFrame()
+    crsp_data_parts = []
     try:
         if "crsp_monthly" in dataset:
             if version == "v1":
@@ -288,7 +444,7 @@ def _download_data_wrds_crsp(
                     if additional_columns_list
                     else ""
                 )
-                msf_query = text(f"""
+                msf_query = f"""
                     SELECT msf.permno, msf.date, msf.ret, msf.shrout,
                            msf.altprc, msf.cfacpr,
                            msn.exchcd, msn.siccd
@@ -300,152 +456,136 @@ def _download_data_wrds_crsp(
                       AND msn.shrcd IN (10, 11)
                     WHERE msf.date BETWEEN '{start_date}'
                           AND '{end_date}'
-                """)
-                msf_data = pd.read_sql_query(
-                    msf_query,
-                    con=wrds_connection,
-                    parse_dates={"date"},
+                """
+                msf_data = _cast_date_columns(
+                    _read_sql(msf_query, wrds_connection), ["date"]
                 )
 
                 # Query 2: msedelist (delisting events)
-                msedelist_query = text(
+                msedelist_query = (
                     "SELECT permno, dlstdt, dlret, dlstcd FROM crsp.msedelist"
                 )
-                msedelist = pd.read_sql_query(
-                    msedelist_query,
-                    con=wrds_connection,
-                    parse_dates={"dlstdt"},
+                msedelist = _cast_date_columns(
+                    _read_sql(msedelist_query, wrds_connection), ["dlstdt"]
                 )
 
                 # Query 3: first_crsp_date per permno
-                first_date_query = text(
+                first_date_query = (
                     "SELECT permno, MIN(namedt) AS first_crsp_date "
                     "FROM crsp.msenames GROUP BY permno"
                 )
-                first_crsp_date = pd.read_sql_query(
-                    first_date_query,
-                    con=wrds_connection,
-                    parse_dates={"first_crsp_date"},
+                first_crsp_date = _cast_date_columns(
+                    _read_sql(first_date_query, wrds_connection),
+                    ["first_crsp_date"],
                 )
 
                 disconnect_connection(wrds_connection)
 
                 # calculation_date + month-floored date
-                crsp_monthly = msf_data.assign(
-                    calculation_date=lambda x: pd.to_datetime(x["date"]),
-                    date=lambda x: (
-                        pd.to_datetime(x["date"])
-                        .dt.to_period("M")
-                        .dt.start_time
-                    ),
-                    shrout=lambda x: x["shrout"] * 1000,
+                crsp_monthly = msf_data.with_columns(
+                    calculation_date=pl.col("date"),
+                    date=pl.col("date").dt.truncate("1mo"),
+                    shrout=pl.col("shrout") * 1000,
                 )
 
                 # Join delisting on (permno, month-floored dlstdt)
-                if len(msedelist) > 0:
-                    msedelist = msedelist.assign(
-                        date=lambda x: (
-                            pd.to_datetime(x["dlstdt"])
-                            .dt.to_period("M")
-                            .dt.start_time
-                        )
-                    )[["permno", "date", "dlret", "dlstcd"]]
-                    crsp_monthly = crsp_monthly.merge(
-                        msedelist, on=["permno", "date"], how="left"
+                if msedelist.height > 0:
+                    msedelist = msedelist.with_columns(
+                        date=pl.col("dlstdt").dt.truncate("1mo")
+                    ).select("permno", "date", "dlret", "dlstcd")
+                    crsp_monthly = crsp_monthly.join(
+                        msedelist,
+                        on=["permno", "date"],
+                        how="left",
+                        maintain_order="left",
                     )
                 else:
-                    crsp_monthly["dlret"] = np.nan
-                    crsp_monthly["dlstcd"] = np.nan
+                    crsp_monthly = crsp_monthly.with_columns(
+                        dlret=pl.lit(None, dtype=pl.Float64),
+                        dlstcd=pl.lit(None, dtype=pl.Float64),
+                    )
 
                 # listing_age (months elapsed, clipped at 0)
                 crsp_monthly = (
-                    crsp_monthly.merge(first_crsp_date, on="permno", how="left")
-                    .assign(
-                        listing_age=lambda df: (
-                            (df["date"].dt.year - df["first_crsp_date"].dt.year)
-                            * 12
-                            + (
-                                df["date"].dt.month
-                                - df["first_crsp_date"].dt.month
-                            )
-                            - (
-                                df["date"].dt.day < df["first_crsp_date"].dt.day
-                            ).astype(int)
-                        ).clip(lower=0)
+                    crsp_monthly.join(
+                        first_crsp_date,
+                        on="permno",
+                        how="left",
+                        maintain_order="left",
                     )
-                    .drop(columns="first_crsp_date")
+                    .with_columns(_listing_age_expr())
+                    .drop("first_crsp_date")
                 )
 
-                # mktcap (millions); zero -> NaN
-                crsp_monthly["mktcap"] = (
-                    crsp_monthly["shrout"] * crsp_monthly["altprc"]
-                ).abs() / 1e6
-                crsp_monthly.loc[crsp_monthly["mktcap"] == 0, "mktcap"] = np.nan
+                # mktcap (millions); zero -> null
+                crsp_monthly = crsp_monthly.with_columns(
+                    mktcap=(pl.col("shrout") * pl.col("altprc")).abs() / 1e6
+                ).with_columns(_zero_to_null("mktcap"))
 
                 # mktcap_lag via self-join shifted by 1 month
-                mktcap_lag_df = crsp_monthly.assign(
-                    date=lambda x: x["date"] + pd.DateOffset(months=1)
-                )[["permno", "date", "mktcap"]].rename(
-                    columns={"mktcap": "mktcap_lag"}
+                mktcap_lag_df = crsp_monthly.select(
+                    "permno",
+                    pl.col("date").dt.offset_by("1mo"),
+                    pl.col("mktcap").alias("mktcap_lag"),
                 )
-                crsp_monthly = crsp_monthly.merge(
-                    mktcap_lag_df, on=["permno", "date"], how="left"
-                )
-
-                # exchange via exchcd (numeric, v1 codes)
-                exchange_map = {
-                    1: "NYSE",
-                    31: "NYSE",
-                    2: "AMEX",
-                    32: "AMEX",
-                    3: "NASDAQ",
-                    33: "NASDAQ",
-                }
-                crsp_monthly["exchange"] = (
-                    crsp_monthly["exchcd"].map(exchange_map).fillna("Other")
+                crsp_monthly = crsp_monthly.join(
+                    mktcap_lag_df,
+                    on=["permno", "date"],
+                    how="left",
+                    maintain_order="left",
                 )
 
-                # industry from SIC code
-                crsp_monthly["industry"] = (
-                    crsp_monthly["siccd"]
-                    .fillna(-1)
-                    .astype(int)
-                    .apply(_assign_industry)
+                # exchange via exchcd (numeric, v1 codes) and industry
+                # from SIC code
+                crsp_monthly = crsp_monthly.with_columns(
+                    _exchange_expr_v1(),
+                    _industry_expr(pl.col("siccd").fill_null(-1)),
                 )
 
                 # ret_adj from delisting code (Shumway-style)
-                def _compute_ret_adj_v1(row):
-                    if pd.isna(row["dlstcd"]):
-                        return row["ret"]
-                    if not pd.isna(row["dlret"]):
-                        return row["dlret"]
-                    code = row["dlstcd"]
-                    if code in (500, 520, 580, 584) or (551 <= code <= 574):
-                        return -0.30
-                    if code == 100:
-                        return row["ret"]
-                    return -1.0
-
-                crsp_monthly["ret_adj"] = crsp_monthly.apply(
-                    _compute_ret_adj_v1, axis=1
-                )
-                crsp_monthly = crsp_monthly.drop(columns=["dlret", "dlstcd"])
+                crsp_monthly = crsp_monthly.with_columns(
+                    ret_adj=(
+                        pl.when(pl.col("dlstcd").is_null())
+                        .then(pl.col("ret"))
+                        .when(pl.col("dlret").is_not_null())
+                        .then(pl.col("dlret"))
+                        .when(
+                            pl.col("dlstcd").is_in([500, 520, 580, 584])
+                            | pl.col("dlstcd").is_between(551, 574)
+                        )
+                        .then(-0.30)
+                        .when(pl.col("dlstcd") == 100)
+                        .then(pl.col("ret"))
+                        .otherwise(-1.0)
+                    )
+                ).drop("dlret", "dlstcd")
 
                 # prc_adj = |altprc nullified-at-zero| / cfacpr
-                prc_zeroed = crsp_monthly["altprc"].replace(0, np.nan)
-                crsp_monthly["prc_adj"] = (
-                    prc_zeroed.abs() / crsp_monthly["cfacpr"]
-                ).replace([np.inf, -np.inf], np.nan)
+                prc_zeroed = (
+                    pl.when(pl.col("altprc") == 0)
+                    .then(None)
+                    .otherwise(pl.col("altprc"))
+                )
+                crsp_monthly = crsp_monthly.with_columns(
+                    prc_adj=_inf_to_null(prc_zeroed.abs() / pl.col("cfacpr"))
+                )
 
                 # Merge risk-free and compute excess return
                 risk_free_monthly = _download_data_risk_free(
                     start_date=start_date, end_date=end_date
                 )
                 crsp_monthly = (
-                    crsp_monthly.merge(risk_free_monthly, how="left", on="date")
-                    .assign(ret_excess=lambda x: x["ret_adj"] - x["risk_free"])
-                    .drop(columns="risk_free")
-                    .dropna(subset=["ret_excess", "mktcap"])
+                    crsp_monthly.join(
+                        risk_free_monthly,
+                        how="left",
+                        on="date",
+                        maintain_order="left",
+                    )
+                    .with_columns(
+                        ret_excess=pl.col("ret_adj") - pl.col("risk_free")
+                    )
+                    .drop("risk_free")
+                    .drop_nulls(subset=["ret_excess", "mktcap"])
                 )
 
                 processed_data = crsp_monthly
@@ -481,78 +621,75 @@ def _download_data_wrds_crsp(
                     AND ssih.tradingstatusflg = 'A'
                     """
 
+                crsp_monthly = _cast_columns(
+                    _cast_date_columns(
+                        _read_sql(crsp_query, wrds_connection),
+                        ["date", "calculation_date", "first_crsp_date"],
+                    ),
+                    {"permno": pl.Int64, "siccd": pl.Int64},
+                )
                 crsp_monthly = (
-                    pd.read_sql_query(
-                        sql=crsp_query,
-                        con=wrds_connection,
-                        dtype={"permno": int, "siccd": int},
-                        parse_dates={
-                            "date",
-                            "calculation_date",
-                            "first_crsp_date",
-                        },
-                    )
-                    .assign(shrout=lambda x: x["shrout"] * 1000)
+                    crsp_monthly.with_columns(shrout=pl.col("shrout") * 1000)
                     # listing_age is assigned before mktcap to keep the
                     # documented column order:
                     # ..., siccd, listing_age, mktcap, mktcap_lag, ...
-                    .assign(
-                        listing_age=lambda df: (
-                            (df["date"].dt.year - df["first_crsp_date"].dt.year)
-                            * 12
-                            + (
-                                df["date"].dt.month
-                                - df["first_crsp_date"].dt.month
-                            )
-                            - (
-                                df["date"].dt.day < df["first_crsp_date"].dt.day
-                            ).astype(int)
-                        ).clip(lower=0)
+                    .with_columns(_listing_age_expr())
+                    .with_columns(
+                        mktcap=pl.col("shrout") * pl.col("prc") / 1000000
                     )
-                    .assign(mktcap=lambda x: x["shrout"] * x["prc"] / 1000000)
-                    .assign(mktcap=lambda x: x["mktcap"].replace(0, np.nan))
-                    .drop(columns=["first_crsp_date"])
+                    .with_columns(_zero_to_null("mktcap"))
+                    .drop("first_crsp_date")
                 )
 
-                mktcap_lag = crsp_monthly.assign(
-                    date=lambda x: x["date"] + pd.DateOffset(months=1),
-                    mktcap_lag=lambda x: x["mktcap"],
-                ).get(["permno", "date", "mktcap_lag"])
+                mktcap_lag = crsp_monthly.select(
+                    "permno",
+                    pl.col("date").dt.offset_by("1mo"),
+                    pl.col("mktcap").alias("mktcap_lag"),
+                )
 
-                crsp_monthly = crsp_monthly.merge(
-                    mktcap_lag, how="left", on=["permno", "date"]
-                ).assign(
-                    exchange=lambda x: x["primaryexch"].apply(_assign_exchange),
-                    industry=lambda x: x["siccd"].apply(_assign_industry),
+                crsp_monthly = crsp_monthly.join(
+                    mktcap_lag,
+                    how="left",
+                    on=["permno", "date"],
+                    maintain_order="left",
+                ).with_columns(
+                    _exchange_expr_v2(),
+                    _industry_expr(pl.col("siccd")),
                 )
                 risk_free_monthly = _download_data_risk_free(
                     start_date=start_date,
                     end_date=end_date,
                 )
                 crsp_monthly = (
-                    crsp_monthly.merge(risk_free_monthly, how="left", on="date")
-                    .assign(ret_excess=lambda x: x["ret"] - x["risk_free"])
-                    .drop(columns=["risk_free"])
-                    .dropna(subset=["ret_excess", "mktcap"])
+                    crsp_monthly.join(
+                        risk_free_monthly,
+                        how="left",
+                        on="date",
+                        maintain_order="left",
+                    )
+                    .with_columns(
+                        ret_excess=pl.col("ret") - pl.col("risk_free")
+                    )
+                    .drop("risk_free")
+                    .drop_nulls(subset=["ret_excess", "mktcap"])
                 )
                 processed_data = crsp_monthly
         elif "crsp_daily" in dataset:
             if version == "v1":
                 # Distinct permnos from dsf within the date range
-                permnos_query = text(
+                permnos_query = (
                     f"SELECT DISTINCT permno FROM crsp.dsf "
                     f"WHERE date BETWEEN '{start_date}' "
                     f"AND '{end_date}'"
                 )
-                permnos = pd.read_sql(
-                    permnos_query,
-                    con=wrds_connection,
-                    dtype={"permno": int},
+                permnos = _cast_columns(
+                    _read_sql(permnos_query, wrds_connection),
+                    {"permno": pl.Int64},
                 )
-                permnos = list(permnos["permno"].astype(str))
+                permnos = [str(p) for p in permnos["permno"].to_list()]
 
                 if len(permnos) > 0:
-                    batches = int(np.ceil(len(permnos) / batch_size))
+                    batches = math.ceil(len(permnos) / batch_size)
                     risk_free_daily = _download_data_risk_free(
                         start_date=start_date,
                         end_date=end_date,
@@ -570,7 +707,7 @@ def _download_data_wrds_crsp(
                         )
                         permno_in = f"({permno_batch_str})"
 
-                        dsf_query = text(f"""
+                        dsf_query = f"""
                             SELECT dsf.permno, dsf.date, dsf.ret
                                 {", " + additional_columns_sql if additional_columns_sql else ""}
                             FROM crsp.dsf AS dsf
@@ -582,165 +719,141 @@ def _download_data_wrds_crsp(
                             WHERE dsf.permno IN {permno_in}
                             AND dsf.date BETWEEN '{start_date}'
                                 AND '{end_date}'
-                        """)
-                        crsp_daily_sub = pd.read_sql_query(
-                            dsf_query,
-                            con=wrds_connection,
-                            parse_dates={"date"},
-                        ).dropna(subset=["permno", "date", "ret"])
+                        """
+                        crsp_daily_sub = _cast_date_columns(
+                            _read_sql(dsf_query, wrds_connection), ["date"]
+                        ).drop_nulls(subset=["permno", "date", "ret"])
 
-                        if crsp_daily_sub.empty:
+                        if crsp_daily_sub.is_empty():
                             continue
 
                         # Per-batch msedelist
-                        msedelist_query = text(
+                        msedelist_query = (
                             "SELECT permno, dlstdt, dlret "
                             "FROM crsp.msedelist "
                             f"WHERE permno IN {permno_in}"
                         )
-                        msedelist_sub = pd.read_sql_query(
-                            msedelist_query,
-                            con=wrds_connection,
-                            parse_dates={"dlstdt"},
-                        ).dropna()
+                        msedelist_sub = _cast_date_columns(
+                            _read_sql(msedelist_query, wrds_connection),
+                            ["dlstdt"],
+                        ).drop_nulls()
 
                         # Merge dsf with msedelist on (permno, date=dlstdt)
-                        if not msedelist_sub.empty:
-                            crsp_daily_sub = crsp_daily_sub.merge(
-                                msedelist_sub.rename(
-                                    columns={"dlstdt": "date"}
-                                ),
+                        if not msedelist_sub.is_empty():
+                            crsp_daily_sub = crsp_daily_sub.join(
+                                msedelist_sub.rename({"dlstdt": "date"}),
                                 on=["permno", "date"],
                                 how="left",
+                                maintain_order="left",
                             )
 
                             # Bind delisting-only rows that don't
                             # match any dsf date
-                            matched_dates = crsp_daily_sub[
-                                crsp_daily_sub["dlret"].notna()
-                            ][["permno", "date"]].drop_duplicates()
-                            unmatched = (
-                                msedelist_sub.merge(
-                                    matched_dates.rename(
-                                        columns={"date": "dlstdt"}
-                                    ),
-                                    on=["permno", "dlstdt"],
-                                    how="left",
-                                    indicator=True,
+                            matched_dates = (
+                                crsp_daily_sub.filter(
+                                    pl.col("dlret").is_not_null()
                                 )
-                                .query("_merge == 'left_only'")
-                                .drop(columns="_merge")
+                                .select("permno", "date")
+                                .unique(maintain_order=True)
                             )
-                            if not unmatched.empty:
+                            unmatched = msedelist_sub.join(
+                                matched_dates.rename({"date": "dlstdt"}),
+                                on=["permno", "dlstdt"],
+                                how="anti",
+                            )
+                            if not unmatched.is_empty():
                                 unmatched = unmatched.rename(
-                                    columns={"dlstdt": "date"}
+                                    {"dlstdt": "date"}
                                 )
-                                for col in crsp_daily_sub.columns:
-                                    if col not in unmatched.columns:
-                                        unmatched[col] = np.nan
-                                unmatched = unmatched[crsp_daily_sub.columns]
-                                crsp_daily_sub = pd.concat(
+                                crsp_daily_sub = pl.concat(
                                     [crsp_daily_sub, unmatched],
-                                    ignore_index=True,
+                                    how="diagonal_relaxed",
                                 )
 
-                            # ret = dlret if not NaN
-                            crsp_daily_sub["ret"] = np.where(
-                                crsp_daily_sub["dlret"].notna(),
-                                crsp_daily_sub["dlret"],
-                                crsp_daily_sub["ret"],
-                            )
-                            crsp_daily_sub = crsp_daily_sub.drop(
-                                columns="dlret"
-                            )
+                            # ret = dlret if not null
+                            crsp_daily_sub = crsp_daily_sub.with_columns(
+                                ret=pl.coalesce("dlret", "ret")
+                            ).drop("dlret")
 
                             # Filter date <= permno's last delisting
                             # date (or end_date if no delisting)
-                            permno_dlstdt = (
-                                msedelist_sub.groupby("permno")["dlstdt"]
-                                .max()
-                                .reset_index()
-                                .rename(columns={"dlstdt": "_permno_dlstdt"})
+                            permno_dlstdt = msedelist_sub.group_by(
+                                "permno", maintain_order=True
+                            ).agg(
+                                pl.col("dlstdt").max().alias("_permno_dlstdt")
                             )
-                            crsp_daily_sub = crsp_daily_sub.merge(
-                                permno_dlstdt,
-                                on="permno",
-                                how="left",
+                            crsp_daily_sub = (
+                                crsp_daily_sub.join(
+                                    permno_dlstdt,
+                                    on="permno",
+                                    how="left",
+                                    maintain_order="left",
+                                )
+                                .with_columns(
+                                    pl.col("_permno_dlstdt").fill_null(
+                                        end_date
+                                    )
+                                )
+                                .filter(
+                                    pl.col("date") <= pl.col("_permno_dlstdt")
+                                )
+                                .drop("_permno_dlstdt")
                             )
-                            crsp_daily_sub["_permno_dlstdt"] = crsp_daily_sub[
-                                "_permno_dlstdt"
-                            ].fillna(pd.Timestamp(end_date))
-                            crsp_daily_sub = crsp_daily_sub[
-                                crsp_daily_sub["date"]
-                                <= crsp_daily_sub["_permno_dlstdt"]
-                            ].drop(columns="_permno_dlstdt")
 
                         # Merge risk_free, compute ret_excess
                         crsp_daily_sub = (
-                            crsp_daily_sub.merge(
+                            crsp_daily_sub.join(
                                 risk_free_daily,
                                 on="date",
                                 how="left",
+                                maintain_order="left",
                             )
-                            .assign(
-                                ret_excess=lambda x: x["ret"] - x["risk_free"]
+                            .with_columns(
+                                ret_excess=pl.col("ret") - pl.col("risk_free")
                             )
-                            .drop(columns="risk_free")
+                            .drop("risk_free")
                         )
 
-                        crsp_data = pd.concat([crsp_data, crsp_daily_sub])
+                        crsp_data_parts.append(crsp_daily_sub)
+
+                crsp_data = (
+                    pl.concat(crsp_data_parts, how="diagonal_relaxed")
+                    if crsp_data_parts
+                    else pl.DataFrame()
+                )
 
                 # Gao-Ritter volume adjustment for NASDAQ (v1: exchcd==3)
-                if adjust_volume and not crsp_data.empty:
-                    gr_date_1 = pd.Timestamp("2001-02-01")
-                    gr_date_2 = pd.Timestamp("2002-01-01")
-                    gr_date_3 = pd.Timestamp("2004-01-01")
-
+                if adjust_volume and not crsp_data.is_empty():
                     crsp_data = (
-                        crsp_data.sort_values(["permno", "date"])
-                        .assign(
-                            vol=lambda df: df["vol"].replace(-99, np.nan),
-                            prc=lambda df: df["prc"].replace(0, np.nan),
+                        crsp_data.sort(["permno", "date"], maintain_order=True)
+                        .with_columns(
+                            pl.when(pl.col("vol") == -99)
+                            .then(None)
+                            .otherwise(pl.col("vol"))
+                            .alias("vol"),
+                            _zero_to_null("prc"),
                         )
-                        .assign(
-                            prc_adj=lambda df: (
-                                df["prc"].abs() / df["cfacpr"]
-                            ).replace([np.inf, -np.inf], np.nan)
-                        )
-                        .assign(
-                            vol_adj=lambda df: np.select(
-                                [
-                                    (df["exchcd"] == 3)
-                                    & (df["date"] < gr_date_1),
-                                    (df["exchcd"] == 3)
-                                    & (df["date"] >= gr_date_1)
-                                    & (df["date"] < gr_date_2),
-                                    (df["exchcd"] == 3)
-                                    & (df["date"] >= gr_date_2)
-                                    & (df["date"] < gr_date_3),
-                                    (df["exchcd"] == 3)
-                                    & (df["date"] >= gr_date_3),
-                                ],
-                                [
-                                    df["vol"] / 2.0,
-                                    df["vol"] / 1.8,
-                                    df["vol"] / 1.6,
-                                    df["vol"] / 1.0,
-                                ],
-                                default=df["vol"],
+                        .with_columns(
+                            prc_adj=_inf_to_null(
+                                pl.col("prc").abs() / pl.col("cfacpr")
                             )
+                        )
+                        .with_columns(
+                            _gao_ritter_vol_adj(pl.col("exchcd") == 3)
                         )
                     )
 
                 processed_data = crsp_data
             elif version == "v2":
-                permnos = pd.read_sql(
-                    sql="SELECT DISTINCT permno FROM crsp.stksecurityinfohist",
-                    con=wrds_connection,
-                    dtype={"permno": int},
+                permnos = _cast_columns(
+                    _read_sql(
+                        "SELECT DISTINCT permno FROM crsp.stksecurityinfohist",
+                        wrds_connection,
+                    ),
+                    {"permno": pl.Int64},
                 )
-                permnos = list(permnos["permno"].astype(str))
-                batches = np.ceil(len(permnos) / batch_size).astype(int)
+                permnos = [str(p) for p in permnos["permno"].to_list()]
+                batches = math.ceil(len(permnos) / batch_size)
 
                 risk_free_daily = _download_data_risk_free(
                     start_date=start_date,
@@ -779,24 +892,26 @@ def _download_data_wrds_crsp(
                         AND ssih.tradingstatusflg = 'A'
                         """
 
-                    crsp_daily_sub = pd.read_sql_query(
-                        sql=crsp_daily_sub_query,
-                        con=wrds_connection,
-                        dtype={"permno": int},
-                        parse_dates={"date"},
-                    ).dropna(subset=["permno", "date", "ret"])
+                    crsp_daily_sub = _cast_columns(
+                        _cast_date_columns(
+                            _read_sql(crsp_daily_sub_query, wrds_connection),
+                            ["date"],
+                        ),
+                        {"permno": pl.Int64},
+                    ).drop_nulls(subset=["permno", "date", "ret"])
 
-                    if not crsp_daily_sub.empty:
+                    if not crsp_daily_sub.is_empty():
                         crsp_daily_sub = (
-                            crsp_daily_sub.merge(
+                            crsp_daily_sub.join(
                                 risk_free_daily,
                                 on="date",
                                 how="left",
+                                maintain_order="left",
                             )
-                            .assign(
-                                ret_excess=lambda x: x["ret"] - x["risk_free"]
+                            .with_columns(
+                                ret_excess=pl.col("ret") - pl.col("risk_free")
                             )
-                            .drop(columns=["risk_free"])
+                            .drop("risk_free")
                         )
 
                     print(
@@ -804,51 +919,37 @@ def _download_data_wrds_crsp(
                         f"({(j / batches) * 100:.2f}%)\n"
                     )
 
-                    crsp_data = pd.concat([crsp_data, crsp_daily_sub])
+                    crsp_data_parts.append(crsp_daily_sub)
 
-                if adjust_volume and not crsp_data.empty:
-                    gr_date_1 = pd.Timestamp("2001-02-01")
-                    gr_date_2 = pd.Timestamp("2002-01-01")
-                    gr_date_3 = pd.Timestamp("2004-01-01")
+                crsp_data = (
+                    pl.concat(crsp_data_parts, how="diagonal_relaxed")
+                    if crsp_data_parts
+                    else pl.DataFrame()
+                )
 
+                if adjust_volume and not crsp_data.is_empty():
                     crsp_data = (
-                        crsp_data.sort_values(["permno", "date"])
-                        .assign(
-                            cfacpr=lambda df: df.groupby("permno")[
-                                "dlyfacprc"
-                            ].cumprod(),
-                            vol=lambda df: df["dlyvol"].replace(-99, np.nan),
-                            prc=lambda df: df["dlyprc"].replace(0, np.nan),
+                        crsp_data.sort(["permno", "date"], maintain_order=True)
+                        .with_columns(
+                            cfacpr=pl.col("dlyfacprc")
+                            .cum_prod()
+                            .over("permno"),
+                            vol=pl.when(pl.col("dlyvol") == -99)
+                            .then(None)
+                            .otherwise(pl.col("dlyvol")),
+                            prc=pl.when(pl.col("dlyprc") == 0)
+                            .then(None)
+                            .otherwise(pl.col("dlyprc")),
                         )
-                        .assign(
-                            prc_adj=lambda df: (
-                                df["prc"].abs() / df["cfacpr"]
-                            ).replace([np.inf, -np.inf], np.nan)
-                        )
-                        .assign(
-                            vol_adj=lambda df: np.select(
-                                [
-                                    (df["primaryexch"] == "Q")
-                                    & (df["date"] < gr_date_1),
-                                    (df["primaryexch"] == "Q")
-                                    & (df["date"] >= gr_date_1)
-                                    & (df["date"] < gr_date_2),
-                                    (df["primaryexch"] == "Q")
-                                    & (df["date"] >= gr_date_2)
-                                    & (df["date"] < gr_date_3),
-                                    (df["primaryexch"] == "Q")
-                                    & (df["date"] >= gr_date_3),
-                                ],
-                                [
-                                    df["vol"] / 2.0,
-                                    df["vol"] / 1.8,
-                                    df["vol"] / 1.6,
-                                    df["vol"] / 1.0,
-                                ],
-                                default=df["vol"],
+                        .with_columns(
+                            prc_adj=_inf_to_null(
+                                pl.col("prc").abs() / pl.col("cfacpr")
                             )
                         )
-                        .drop(columns=["dlyvol", "dlyprc", "dlyfacprc"])
+                        .with_columns(
+                            _gao_ritter_vol_adj(pl.col("primaryexch") == "Q")
+                        )
+                        .drop("dlyvol", "dlyprc", "dlyfacprc")
                     )
 
                 processed_data = crsp_data
@@ -861,14 +962,19 @@ def _download_data_wrds_crsp(
 
     if add_ccm_links:
         ccm_links = _download_data_wrds_ccm_links()
-        merged = processed_data[["permno", "date"]].merge(
-            ccm_links, on="permno", how="inner"
+        merged = processed_data.select("permno", "date").join(
+            ccm_links, on="permno", how="inner", maintain_order="left"
         )
-        valid_links = merged.query(
-            "gvkey.notna() and linkdt <= date <= linkenddt"
-        )[["permno", "gvkey", "date"]]
-        processed_data = processed_data.merge(
-            valid_links, on=["permno", "date"], how="left"
+        valid_links = merged.filter(
+            pl.col("gvkey").is_not_null()
+            & (pl.col("linkdt") <= pl.col("date"))
+            & (pl.col("date") <= pl.col("linkenddt"))
+        ).select("permno", "gvkey", "date")
+        processed_data = processed_data.join(
+            valid_links,
+            on=["permno", "date"],
+            how="left",
+            maintain_order="left",
         )
 
     return processed_data
@@ -876,7 +982,7 @@ def _download_data_wrds_crsp(
 
 def _download_data_wrds_ccm_links(
     linktype: list[str] = ["LU", "LC"], linkprim: list[str] = ["P", "C"]
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download data from the WRDS CRSP/Compustat Merged (CCM) links database.
 
@@ -891,7 +997,7 @@ def _download_data_wrds_ccm_links(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing columns permno, gvkey, linkdt, and
         linkenddt (missing end dates replaced with today's date).
     """
@@ -904,9 +1010,14 @@ def _download_data_wrds_ccm_links(
         AND linkprim IN ({",".join(f"'{lp}'" for lp in linkprim)})
     """
 
-    ccm_links = pd.read_sql(query, conn)
+    ccm_links = _cast_columns(
+        _cast_date_columns(_read_sql(query, conn), ["linkdt", "linkenddt"]),
+        {"permno": pl.Int64},
+    )
 
-    ccm_links["linkenddt"] = ccm_links["linkenddt"].fillna(pd.Timestamp.today())
+    ccm_links = ccm_links.with_columns(
+        pl.col("linkenddt").fill_null(dt.date.today())
+    )
 
     disconnect_connection(conn)
 
@@ -921,7 +1032,7 @@ def _download_data_wrds_compustat(
     additional_columns: list = None,
     only_usd: bool = False,
     only_us: bool = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download data from WRDS Compustat.
 
@@ -965,7 +1076,7 @@ def _download_data_wrds_compustat(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with financial data for the specified period,
         including variables for book equity ('be'), operating
         profitability ('op'), investment ('inv'), and others.
@@ -1082,7 +1193,7 @@ def _download_data_wrds_compustat(
     )
 
     if "compustat_annual" in dataset:
-        query = text(f"""
+        query = f"""
             SELECT gvkey, datadate, seq, ceq, at, lt, txditc, txdb, itcb,
                 pstkrv, pstkl, pstk, capx, oancf, sale, cogs, xint, xsga,
                 ib, curcd
@@ -1090,114 +1201,124 @@ def _download_data_wrds_compustat(
             FROM comp.funda
             WHERE indfmt = 'INDL' AND datafmt = 'STD' AND consol = 'C'
             AND datadate BETWEEN '{start_date}' AND '{end_date}'
-        """)
+        """
 
-        compustat = pd.read_sql(query, wrds_connection)
+        compustat = _cast_date_columns(
+            _read_sql(query, wrds_connection), ["datadate"]
+        )
         disconnect_connection(wrds_connection)
 
         # Compute Book Equity (be)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            compustat = compustat.assign(
-                be=lambda x: (
-                    x["seq"]
-                    .combine_first(x["ceq"] + x["pstk"])
-                    .combine_first(x["at"] - x["lt"])
-                    + x["txditc"].combine_first(x["txdb"] + x["itcb"]).fillna(0)
-                    - x["pstkrv"]
-                    .combine_first(x["pstkl"])
-                    .combine_first(x["pstk"])
-                    .fillna(0)
+        compustat = compustat.with_columns(
+            be=(
+                pl.coalesce(
+                    pl.col("seq"),
+                    pl.col("ceq") + pl.col("pstk"),
+                    pl.col("at") - pl.col("lt"),
                 )
-            ).assign(
-                be=lambda x: x["be"].apply(lambda y: np.nan if y <= 0 else y)
+                + pl.coalesce(
+                    pl.col("txditc"), pl.col("txdb") + pl.col("itcb")
+                ).fill_null(0)
+                - pl.coalesce(
+                    pl.col("pstkrv"), pl.col("pstkl"), pl.col("pstk")
+                ).fill_null(0)
             )
+        ).with_columns(
+            be=pl.when(pl.col("be") <= 0).then(None).otherwise(pl.col("be"))
+        )
         # Compute Operating Profitability (op)
-        compustat = compustat.assign(
-            op=lambda df: (
-                (
-                    df["sale"]
-                    - df[["cogs", "xsga", "xint"]].fillna(0).sum(axis=1)
+        compustat = compustat.with_columns(
+            op=(
+                pl.col("sale")
+                - (
+                    pl.col("cogs").fill_null(0)
+                    + pl.col("xsga").fill_null(0)
+                    + pl.col("xint").fill_null(0)
                 )
-                / df["be"]
             )
+            / pl.col("be")
         )
         # Keep the latest report per company per year
         compustat = (
-            compustat.assign(
-                year=lambda x: pd.DatetimeIndex(x["datadate"]).year
-            )
-            .sort_values("datadate")
-            .groupby(["gvkey", "year"])
-            .tail(1)
-            .reset_index(drop=True)
+            compustat.with_columns(year=pl.col("datadate").dt.year())
+            .sort("datadate", maintain_order=True)
+            .unique(subset=["gvkey", "year"], keep="last", maintain_order=True)
         )
         # Compute Investment (inv)
-        compustat_lag = (
-            compustat.get(["gvkey", "year", "at"])
-            .assign(year=lambda x: x["year"] + 1)
-            .rename(columns={"at": "at_lag"})
+        compustat_lag = compustat.select(
+            "gvkey",
+            (pl.col("year") + 1).alias("year"),
+            pl.col("at").alias("at_lag"),
         )
 
         compustat = (
-            compustat.merge(compustat_lag, how="left", on=["gvkey", "year"])
-            .assign(inv=lambda x: x["at"] / x["at_lag"] - 1)
-            .assign(inv=lambda x: np.where(x["at_lag"] <= 0, np.nan, x["inv"]))
+            compustat.join(
+                compustat_lag,
+                how="left",
+                on=["gvkey", "year"],
+                maintain_order="left",
+            )
+            .with_columns(inv=pl.col("at") / pl.col("at_lag") - 1)
+            .with_columns(
+                inv=pl.when(pl.col("at_lag") <= 0)
+                .then(None)
+                .otherwise(pl.col("inv"))
+            )
         )
 
         if only_usd:
-            compustat = compustat[compustat["curcd"] == "USD"]
+            compustat = compustat.filter(pl.col("curcd") == "USD")
 
-        processed_data = compustat.assign(
-            date=lambda df: (
-                pd.to_datetime(df["datadate"]).dt.to_period("M").dt.start_time
-            )
-        ).drop(columns=["year", "at_lag", "curcd"])
+        processed_data = compustat.with_columns(
+            date=pl.col("datadate").dt.truncate("1mo")
+        ).drop("year", "at_lag", "curcd")
 
     elif "compustat_quarterly" in dataset:
-        query = text(f"""
+        query = f"""
             SELECT gvkey, datadate, rdq, fqtr, fyearq, atq, ceqq, curcdq
                 {", " + additional_columns_quarterly if additional_columns_quarterly else ""}
             FROM comp.fundq
             WHERE indfmt = 'INDL' AND datafmt = 'STD' AND consol = 'C'
             AND datadate BETWEEN '{start_date}' AND '{end_date}'
-        """)
+        """
 
-        compustat = pd.read_sql(query, wrds_connection)
+        compustat = _cast_date_columns(
+            _read_sql(query, wrds_connection), ["datadate", "rdq"]
+        )
         disconnect_connection(wrds_connection)
 
         # Ensure necessary columns are not missing
         compustat = (
-            compustat.dropna(subset=["gvkey", "datadate", "fyearq", "fqtr"])
-            .assign(
-                date=lambda df: (
-                    pd.to_datetime(df["datadate"])
-                    .dt.to_period("M")
-                    .dt.start_time
-                )
+            compustat.drop_nulls(subset=["gvkey", "datadate", "fyearq", "fqtr"])
+            .with_columns(date=pl.col("datadate").dt.truncate("1mo"))
+            .sort("datadate", descending=True, maintain_order=True)
+            .unique(
+                subset=["gvkey", "fyearq", "fqtr"],
+                keep="first",
+                maintain_order=True,
             )
-            .sort_values("datadate", ascending=False, kind="stable")
-            .drop_duplicates(subset=["gvkey", "fyearq", "fqtr"], keep="first")
-            .sort_values(
-                ["gvkey", "date", "rdq"], na_position="last", kind="stable"
+            .sort(
+                ["gvkey", "date", "rdq"],
+                nulls_last=True,
+                maintain_order=True,
             )
-            .drop_duplicates(subset=["gvkey", "date"], keep="first")
-            .query("rdq.isna() or date < rdq")
+            .unique(subset=["gvkey", "date"], keep="first", maintain_order=True)
+            .filter(pl.col("rdq").is_null() | (pl.col("date") < pl.col("rdq")))
         )
 
         if only_usd:
-            compustat = compustat[compustat["curcdq"] == "USD"]
+            compustat = compustat.filter(pl.col("curcdq") == "USD")
 
         base_output_cols = ["gvkey", "date", "datadate", "atq", "ceqq"]
         requested_quarterly = [
             c for c in (additional_columns or []) if c not in base_output_cols
         ]
-        processed_data = compustat.get(base_output_cols + requested_quarterly)
+        processed_data = compustat.select(base_output_cols + requested_quarterly)
 
     return processed_data
 
 
-def _download_data_wrds_fisd(additional_columns: list = None) -> pd.DataFrame:
+def _download_data_wrds_fisd(additional_columns: list = None) -> pl.DataFrame:
     """
     Download filtered FISD data from WRDS.
 
@@ -1219,7 +1340,7 @@ def _download_data_wrds_fisd(additional_columns: list = None) -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing a subset of FISD data with fields
         related to the bond's characteristics and issuer information.
         This includes complete CUSIP, maturity date, offering amount,
@@ -1282,20 +1403,16 @@ def _download_data_wrds_fisd(additional_columns: list = None) -> pd.DataFrame:
         "AND (preferred_security = 'N' OR preferred_security IS NULL)"
     )
 
-    fisd = pd.read_sql_query(
-        sql=fisd_query,
-        con=wrds_connection,
-        dtype={
-            "complete_cusip": str,
-            "interest_frequency": str,
-            "issue_id": int,
-            "issuer_id": int,
-        },
-        parse_dates={
-            "maturity",
-            "offering_date",
-            "dated_date",
-            "last_interest_date",
+    fisd = _cast_columns(
+        _cast_date_columns(
+            _read_sql(fisd_query, wrds_connection),
+            ["maturity", "offering_date", "dated_date", "last_interest_date"],
+        ),
+        {
+            "complete_cusip": pl.String,
+            "interest_frequency": pl.String,
+            "issue_id": pl.Int64,
+            "issuer_id": pl.Int64,
         },
     )
 
@@ -1304,26 +1421,31 @@ def _download_data_wrds_fisd(additional_columns: list = None) -> pd.DataFrame:
         "FROM fisd.fisd_mergedissuer"
     )
 
-    fisd_issuer = pd.read_sql_query(
-        sql=fisd_issuer_query,
-        con=wrds_connection,
-        dtype={"issuer_id": int, "sic_code": str, "country_domicile": str},
+    fisd_issuer = _cast_columns(
+        _read_sql(fisd_issuer_query, wrds_connection),
+        {
+            "issuer_id": pl.Int64,
+            "sic_code": pl.String,
+            "country_domicile": pl.String,
+        },
     )
 
     fisd = (
-        fisd.merge(fisd_issuer, how="inner", on="issuer_id")
-        .query("country_domicile == 'USA'")
-        .drop(columns="country_domicile")
+        fisd.join(
+            fisd_issuer, how="inner", on="issuer_id", maintain_order="left"
+        )
+        .filter(pl.col("country_domicile") == "USA")
+        .drop("country_domicile")
     )
 
     disconnect_connection(wrds_connection)
 
-    return fisd.reset_index(drop=True)
+    return fisd
 
 
 def _download_data_wrds_trace_enhanced(
     cusips: list, start_date: str = None, end_date: str = None
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download Enhanced TRACE data from WRDS.
 
@@ -1347,7 +1469,7 @@ def _download_data_wrds_trace_enhanced(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing the cleaned trade messages from TRACE
         for the selected CUSIPs over the time window specified. Output
         variables include identifying information (i.e., CUSIP, trade
@@ -1394,11 +1516,7 @@ def _download_data_wrds_trace_enhanced(
     if start_date and end_date:
         query += f"AND trd_exctn_dt BETWEEN '{start_date}' AND '{end_date}'"
 
-    trace_enhanced_raw = pd.read_sql(
-        query,
-        wrds_connection,
-        parse_dates={"trd_exctn_dt", "trd_rpt_dt", "stlmnt_dt"},
-    )
+    trace_enhanced_raw = _read_sql(query, wrds_connection)
     disconnect_connection(wrds_connection)
 
     trace_enhanced = process_trace_data(trace_enhanced_raw)
@@ -1422,7 +1540,8 @@ def get_wrds_connection() -> object:
     sqlalchemy.engine.Connection
         An open SQLAlchemy connection to the WRDS database. Pass it to any
         'download_data_wrds_*' helper or use it directly with
-        'pd.read_sql_query'. Close it via 'disconnect_connection' when done.
+        'polars.read_database'. Close it via 'disconnect_connection' when
+        done.
 
     Raises
     ------
@@ -1566,7 +1685,7 @@ def _process_additional_columns(additional_columns):
     return ", " + ", ".join(additional_columns)
 
 
-def process_trace_data(trace_all: pd.DataFrame) -> pd.DataFrame:
+def process_trace_data(trace_all: pl.DataFrame) -> pl.DataFrame:
     """Clean Enhanced TRACE trade reports.
 
     Applies the Dick-Nielsen cleaning protocol to the raw Enhanced
@@ -1576,7 +1695,7 @@ def process_trace_data(trace_all: pd.DataFrame) -> pd.DataFrame:
 
     Parameters
     ----------
-    trace_all : pd.DataFrame
+    trace_all : pl.DataFrame
         Raw Enhanced TRACE messages with the message-status columns
         used by the cleaning protocol ('trc_st', 'msg_seq_nb',
         'orig_msg_seq_nb', 'trd_rpt_dt', 'trd_rpt_tm',
@@ -1585,7 +1704,7 @@ def process_trace_data(trace_all: pd.DataFrame) -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Cleaned trade panel containing only executed trades with
         cancellations, corrections, and reversals already removed.
 
@@ -1607,280 +1726,314 @@ def process_trace_data(trace_all: pd.DataFrame) -> pd.DataFrame:
     Dick-Nielsen, J. (2014). How to clean enhanced TRACE data. Working
     Paper. https://ssrn.com/abstract=2337908
     """
+    cutoff = dt.date(2012, 2, 6)
+
+    # Normalize calendar-date columns to pl.Date (raw user-supplied
+    # frames may carry datetimes).
+    trace_all = _cast_date_columns(
+        trace_all, ["trd_exctn_dt", "trd_rpt_dt", "stlmnt_dt"]
+    )
+
+    # The pandas reference merged with how="left" and no explicit keys,
+    # which joins on all shared columns; the polars joins below list
+    # those shared columns explicitly.
+    post_keys = [
+        "cusip_id",
+        "msg_seq_nb",
+        "entrd_vol_qt",
+        "rptd_pr",
+        "rpt_side_cd",
+        "cntra_mp_id",
+        "trd_exctn_dt",
+        "trd_exctn_tm",
+    ]
+
     # Post 2012-02-06
     # Trades (trc_st = T) and correction (trc_st = R)
-    trace_post_TR = trace_all.query("trc_st in ['T', 'R']").query(
-        "trd_rpt_dt >= '2012-02-06'"
+    trace_post_TR = trace_all.filter(
+        pl.col("trc_st").is_in(["T", "R"]) & (pl.col("trd_rpt_dt") >= cutoff)
     )
 
     # Cancellations (trc_st = X) and correction cancellations (trc_st = C)
     trace_post_XC = (
-        trace_all.query("trc_st in ['X', 'C']")
-        .query("trd_rpt_dt >= '2012-02-06'")
-        .get(
-            [
-                "cusip_id",
-                "msg_seq_nb",
-                "entrd_vol_qt",
-                "rptd_pr",
-                "rpt_side_cd",
-                "cntra_mp_id",
-                "trd_exctn_dt",
-                "trd_exctn_tm",
-            ]
+        trace_all.filter(
+            pl.col("trc_st").is_in(["X", "C"])
+            & (pl.col("trd_rpt_dt") >= cutoff)
         )
-        .assign(drop=True)
+        .select(post_keys)
+        .with_columns(drop=pl.lit(True))
     )
 
     # Cleaning corrected and cancelled trades
     trace_post_TR = (
-        trace_post_TR.merge(trace_post_XC, how="left")
-        .query("drop != True")
-        .drop(columns="drop")
+        trace_post_TR.join(
+            trace_post_XC, on=post_keys, how="left", maintain_order="left"
+        )
+        .filter(pl.col("drop").ne_missing(True))
+        .drop("drop")
     )
 
     # Reversals (trc_st = Y)
     trace_post_Y = (
-        trace_all.query("trc_st == 'Y'")
-        .query("trd_rpt_dt >= '2012-02-06'")
-        .get(
-            [
-                "cusip_id",
-                "orig_msg_seq_nb",
-                "entrd_vol_qt",
-                "rptd_pr",
-                "rpt_side_cd",
-                "cntra_mp_id",
-                "trd_exctn_dt",
-                "trd_exctn_tm",
-            ]
+        trace_all.filter(
+            (pl.col("trc_st") == "Y") & (pl.col("trd_rpt_dt") >= cutoff)
         )
-        .assign(drop=True)
-        .rename(columns={"orig_msg_seq_nb": "msg_seq_nb"})
+        .select(
+            "cusip_id",
+            pl.col("orig_msg_seq_nb").alias("msg_seq_nb"),
+            "entrd_vol_qt",
+            "rptd_pr",
+            "rpt_side_cd",
+            "cntra_mp_id",
+            "trd_exctn_dt",
+            "trd_exctn_tm",
+        )
+        .with_columns(drop=pl.lit(True))
     )
 
     # Clean reversals
     # Match the orig_msg_seq_nb of Y-message to msg_seq_nb of main message
     trace_post = (
-        trace_post_TR.merge(trace_post_Y, how="left")
-        .query("drop != True")
-        .drop(columns="drop")
+        trace_post_TR.join(
+            trace_post_Y, on=post_keys, how="left", maintain_order="left"
+        )
+        .filter(pl.col("drop").ne_missing(True))
+        .drop("drop")
     )
 
     # Enhanced TRACE: Pre 2012-02-06
     # Pre 2012-02-06
     # Trades (trc_st = T)
-    trace_pre_T = trace_all.query("trd_rpt_dt < '2012-02-06'")
+    trace_pre_T = trace_all.filter(
+        (pl.col("trc_st") == "T") & (pl.col("trd_rpt_dt") < cutoff)
+    )
 
     # Cancellations (trc_st = C)
     trace_pre_C = (
-        trace_all.query("trc_st == 'C'")
-        .query("trd_rpt_dt < '2012-02-06'")
-        .get(
-            [
-                "cusip_id",
-                "orig_msg_seq_nb",
-                "entrd_vol_qt",
-                "rptd_pr",
-                "rpt_side_cd",
-                "cntra_mp_id",
-                "trd_exctn_dt",
-                "trd_exctn_tm",
-            ]
+        trace_all.filter(
+            (pl.col("trc_st") == "C") & (pl.col("trd_rpt_dt") < cutoff)
         )
-        .assign(drop=True)
-        .rename(columns={"orig_msg_seq_nb": "msg_seq_nb"})
+        .select(
+            "cusip_id",
+            pl.col("orig_msg_seq_nb").alias("msg_seq_nb"),
+            "entrd_vol_qt",
+            "rptd_pr",
+            "rpt_side_cd",
+            "cntra_mp_id",
+            "trd_exctn_dt",
+            "trd_exctn_tm",
+        )
+        .with_columns(drop=pl.lit(True))
     )
 
     # Remove cancellations from trades
     # Match orig_msg_seq_nb of C-message to msg_seq_nb of main message
     trace_pre_T = (
-        trace_pre_T.merge(trace_pre_C, how="left")
-        .query("drop != True")
-        .drop(columns="drop")
+        trace_pre_T.join(
+            trace_pre_C, on=post_keys, how="left", maintain_order="left"
+        )
+        .filter(pl.col("drop").ne_missing(True))
+        .drop("drop")
     )
 
     # Corrections (trc_st = W)
-    trace_pre_W = trace_all.query("trc_st == 'W'").query(
-        "trd_rpt_dt < '2012-02-06'"
+    trace_pre_W = trace_all.filter(
+        (pl.col("trc_st") == "W") & (pl.col("trd_rpt_dt") < cutoff)
     )
 
     # Implement corrections in a loop
     # Correction control
-    correction_control = len(trace_pre_W)
-    correction_control_last = len(trace_pre_W)
+    correction_control = trace_pre_W.height
+    correction_control_last = trace_pre_W.height
 
     # Correction loop
     while correction_control > 0:
         # Create placeholder
-        ## Only identifying columns of trace_pre_T (for joins)
-        placeholder_trace_pre_T = (
-            trace_pre_T.get(["cusip_id", "trd_exctn_dt", "msg_seq_nb"])
-            .rename(columns={"msg_seq_nb": "orig_msg_seq_nb"})
-            .assign(matched_T=True)
+        # Only identifying columns of trace_pre_T (for joins)
+        placeholder_trace_pre_T = trace_pre_T.select(
+            "cusip_id",
+            "trd_exctn_dt",
+            pl.col("msg_seq_nb").alias("orig_msg_seq_nb"),
+        ).with_columns(matched_T=pl.lit(True))
+
+        w_keys = ["cusip_id", "trd_exctn_dt", "orig_msg_seq_nb"]
+        trace_pre_W_joined = trace_pre_W.join(
+            placeholder_trace_pre_T,
+            on=w_keys,
+            how="left",
+            maintain_order="left",
         )
 
         # Corrections that correct some msg
-        trace_pre_W_correcting = (
-            trace_pre_W.merge(placeholder_trace_pre_T, how="left")
-            .query("matched_T == True")
-            .drop(columns="matched_T")
-        )
+        trace_pre_W_correcting = trace_pre_W_joined.filter(
+            pl.col("matched_T").eq_missing(True)
+        ).drop("matched_T")
 
         # Corrections that do not correct some msg
-        trace_pre_W = (
-            trace_pre_W.merge(placeholder_trace_pre_T, how="left")
-            .query("matched_T != True")
-            .drop(columns="matched_T")
-        )
+        trace_pre_W = trace_pre_W_joined.filter(
+            pl.col("matched_T").ne_missing(True)
+        ).drop("matched_T")
 
         # Create placeholder
         # Only identifying columns of trace_pre_W_correcting (for anti-joins)
-        placeholder_trace_pre_W_correcting = (
-            trace_pre_W_correcting.get(
-                ["cusip_id", "trd_exctn_dt", "orig_msg_seq_nb"]
-            )
-            .rename(columns={"orig_msg_seq_nb": "msg_seq_nb"})
-            .assign(corrected=True)
-        )
+        placeholder_trace_pre_W_correcting = trace_pre_W_correcting.select(
+            "cusip_id",
+            "trd_exctn_dt",
+            pl.col("orig_msg_seq_nb").alias("msg_seq_nb"),
+        ).with_columns(corrected=pl.lit(True))
 
         # Delete msgs that are corrected
         trace_pre_T = (
-            trace_pre_T.merge(placeholder_trace_pre_W_correcting, how="left")
-            .query("corrected != True")
-            .drop(columns="corrected")
+            trace_pre_T.join(
+                placeholder_trace_pre_W_correcting,
+                on=["cusip_id", "trd_exctn_dt", "msg_seq_nb"],
+                how="left",
+                maintain_order="left",
+            )
+            .filter(pl.col("corrected").ne_missing(True))
+            .drop("corrected")
         )
 
         # Add correction msgs
-        trace_pre_T = pd.concat([trace_pre_T, trace_pre_W_correcting])
+        trace_pre_T = pl.concat(
+            [trace_pre_T, trace_pre_W_correcting], how="diagonal_relaxed"
+        )
 
         # Escape if no corrections remain or they cannot be matched
-        correction_control = len(trace_pre_W)
+        correction_control = trace_pre_W.height
 
         if correction_control == correction_control_last:
             break
         else:
-            correction_control_last = len(trace_pre_W)
+            correction_control_last = trace_pre_W.height
             continue
+
+    sort_cols = [
+        "cusip_id",
+        "trd_exctn_dt",
+        "trd_exctn_tm",
+        "trd_rpt_dt",
+        "trd_rpt_tm",
+    ]
 
     # Reversals (asof_cd = R)
     # Record reversals
-    trace_pre_R = trace_pre_T.query("asof_cd == 'R'").sort_values(
-        ["cusip_id", "trd_exctn_dt", "trd_exctn_tm", "trd_rpt_dt", "trd_rpt_tm"]
+    trace_pre_R = trace_pre_T.filter(pl.col("asof_cd") == "R").sort(
+        sort_cols, maintain_order=True
     )
 
     # Prepare final data
-    trace_pre = trace_pre_T.query(
-        "asof_cd == None | asof_cd.isnull() | asof_cd not in ['R', 'X', 'D']"
-    ).sort_values(
-        ["cusip_id", "trd_exctn_dt", "trd_exctn_tm", "trd_rpt_dt", "trd_rpt_tm"]
-    )
+    trace_pre = trace_pre_T.filter(
+        pl.col("asof_cd").is_null()
+        | ~pl.col("asof_cd").is_in(["R", "X", "D"])
+    ).sort(sort_cols, maintain_order=True)
 
     # Add grouped row numbers
-    trace_pre_R["seq"] = trace_pre_R.groupby(
-        [
-            "cusip_id",
-            "trd_exctn_dt",
-            "entrd_vol_qt",
-            "rptd_pr",
-            "rpt_side_cd",
-            "cntra_mp_id",
-        ]
-    ).cumcount()
-
-    trace_pre["seq"] = trace_pre.groupby(
-        [
-            "cusip_id",
-            "trd_exctn_dt",
-            "entrd_vol_qt",
-            "rptd_pr",
-            "rpt_side_cd",
-            "cntra_mp_id",
-        ]
-    ).cumcount()
+    group_cols = [
+        "cusip_id",
+        "trd_exctn_dt",
+        "entrd_vol_qt",
+        "rptd_pr",
+        "rpt_side_cd",
+        "cntra_mp_id",
+    ]
+    trace_pre_R = trace_pre_R.with_columns(
+        seq=pl.int_range(pl.len()).over(group_cols)
+    )
+    trace_pre = trace_pre.with_columns(
+        seq=pl.int_range(pl.len()).over(group_cols)
+    )
 
     # Select columns for reversal cleaning
-    trace_pre_R = trace_pre_R.get(
-        [
-            "cusip_id",
-            "trd_exctn_dt",
-            "entrd_vol_qt",
-            "rptd_pr",
-            "rpt_side_cd",
-            "cntra_mp_id",
-            "seq",
-        ]
-    ).assign(reversal=True)
+    trace_pre_R = trace_pre_R.select(group_cols + ["seq"]).with_columns(
+        reversal=pl.lit(True)
+    )
 
     # Remove reversals and the reversed trade
     trace_pre = (
-        trace_pre.merge(trace_pre_R, how="left")
-        .query("reversal != True")
-        .drop(columns=["reversal", "seq"])
+        trace_pre.join(
+            trace_pre_R,
+            on=group_cols + ["seq"],
+            how="left",
+            maintain_order="left",
+        )
+        .filter(pl.col("reversal").ne_missing(True))
+        .drop("reversal", "seq")
     )
 
     # Combine pre and post trades
-    trace_clean = pd.concat([trace_pre, trace_post])
+    trace_clean = pl.concat([trace_pre, trace_post], how="diagonal_relaxed")
 
     # Keep agency sells and unmatched agency buys
-    trace_agency_sells = trace_clean.query(
-        "cntra_mp_id == 'D' & rpt_side_cd == 'S'"
+    trace_agency_sells = trace_clean.filter(
+        (pl.col("cntra_mp_id") == "D") & (pl.col("rpt_side_cd") == "S")
     )
 
     # Placeholder for trace_agency_sells with relevant columns
-    placeholder_trace_agency_sells = trace_agency_sells.get(
-        ["cusip_id", "trd_exctn_dt", "entrd_vol_qt", "rptd_pr"]
-    ).assign(matched=True)
+    agency_keys = ["cusip_id", "trd_exctn_dt", "entrd_vol_qt", "rptd_pr"]
+    placeholder_trace_agency_sells = trace_agency_sells.select(
+        agency_keys
+    ).with_columns(matched=pl.lit(True))
 
     # Agency buys that are unmatched
     trace_agency_buys_filtered = (
-        trace_clean.query("cntra_mp_id == 'D' & rpt_side_cd == 'B'")
-        .merge(placeholder_trace_agency_sells, how="left")
-        .query("matched != True")
-        .drop(columns="matched")
+        trace_clean.filter(
+            (pl.col("cntra_mp_id") == "D") & (pl.col("rpt_side_cd") == "B")
+        )
+        .join(
+            placeholder_trace_agency_sells,
+            on=agency_keys,
+            how="left",
+            maintain_order="left",
+        )
+        .filter(pl.col("matched").ne_missing(True))
+        .drop("matched")
     )
 
     # Non-agency
-    trace_nonagency = trace_clean.query("cntra_mp_id == 'C'")
+    trace_nonagency = trace_clean.filter(pl.col("cntra_mp_id") == "C")
 
     # Agency cleaned
-    trace_clean = pd.concat(
-        [trace_nonagency, trace_agency_sells, trace_agency_buys_filtered]
+    trace_clean = pl.concat(
+        [trace_nonagency, trace_agency_sells, trace_agency_buys_filtered],
+        how="diagonal_relaxed",
     )
 
     # Additional Filters
     trace_add_filters = (
-        trace_clean.assign(
-            days_to_sttl_ct2=lambda x: (
-                (x["stlmnt_dt"] - x["trd_exctn_dt"]).dt.days
-            )
+        trace_clean.with_columns(
+            days_to_sttl_ct2=(
+                pl.col("stlmnt_dt") - pl.col("trd_exctn_dt")
+            ).dt.total_days(),
+            days_to_sttl_ct=pl.col("days_to_sttl_ct")
+            .cast(pl.String)
+            .cast(pl.Float64, strict=False),
         )
-        .assign(
-            days_to_sttl_ct=lambda x: pd.to_numeric(
-                x["days_to_sttl_ct"], errors="coerce"
-            )
+        .filter(
+            pl.col("days_to_sttl_ct").is_null()
+            | (pl.col("days_to_sttl_ct") <= 7)
         )
-        .query("days_to_sttl_ct.isnull() | days_to_sttl_ct <= 7")
-        .query("days_to_sttl_ct2.isnull() | days_to_sttl_ct2 <= 7")
-        .query("wis_fl == 'N'")
-        .query("spcl_trd_fl.isnull() | spcl_trd_fl == ''")
-        .query("asof_cd.isnull() | asof_cd == ''")
+        .filter(
+            pl.col("days_to_sttl_ct2").is_null()
+            | (pl.col("days_to_sttl_ct2") <= 7)
+        )
+        .filter(pl.col("wis_fl") == "N")
+        .filter(pl.col("spcl_trd_fl").is_null() | (pl.col("spcl_trd_fl") == ""))
+        .filter(pl.col("asof_cd").is_null() | (pl.col("asof_cd") == ""))
     )
 
     # Only keep necessary columns
-    trace_final = trace_add_filters.sort_values(
-        ["cusip_id", "trd_exctn_dt", "trd_exctn_tm"]
-    ).get(
-        [
-            "cusip_id",
-            "trd_exctn_dt",
-            "trd_exctn_tm",
-            "rptd_pr",
-            "entrd_vol_qt",
-            "yld_pt",
-            "rpt_side_cd",
-            "cntra_mp_id",
-        ]
+    trace_final = trace_add_filters.sort(
+        ["cusip_id", "trd_exctn_dt", "trd_exctn_tm"], maintain_order=True
+    ).select(
+        "cusip_id",
+        "trd_exctn_dt",
+        "trd_exctn_tm",
+        "rptd_pr",
+        "entrd_vol_qt",
+        "yld_pt",
+        "rpt_side_cd",
+        "cntra_mp_id",
     )
 
     return trace_final
@@ -1987,8 +2140,6 @@ def set_wrds_credentials() -> None:
         "WRDS credentials have been set and saved in .env in your "
         f"{location_choice} directory."
     )
-
-
 
 
 def _assign_exchange(primaryexch):

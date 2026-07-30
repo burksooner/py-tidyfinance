@@ -1,12 +1,13 @@
 """Tests for download_data_fred_md (FRED-MD / FRED-QD)."""
 
+import datetime as dt
 import io
 import os
 import sys
 import zipfile
 from unittest.mock import MagicMock, patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -82,29 +83,29 @@ def test_latest_is_wide_raw_levels():
     """vintage='latest' returns a wide [date, <series...>] frame of raw levels."""
     with _patch():
         result = _download_data_fred_md("FRED-MD")
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert list(result.columns) == ["date", "LEVELSER", "LOGDIFFSER"]
     assert "vintage" not in result.columns
-    assert result["date"].iloc[0] == pd.Timestamp("2020-01-01")
-    assert result["LEVELSER"].tolist() == [100, 101, 102]
+    assert result["date"][0] == dt.date(2020, 1, 1)
+    assert result["LEVELSER"].to_list() == [100, 101, 102]
 
 
 def test_transform_applies_per_series_tcode():
     """transform=True applies each series' tcode; a tcode-1 series is unchanged."""
     with _patch():
         result = _download_data_fred_md("FRED-MD", transform=True)
-    assert result["LEVELSER"].tolist() == [100, 101, 102]  # tcode 1: unchanged
+    assert result["LEVELSER"].to_list() == [100, 101, 102]  # unchanged
     logdiff = result["LOGDIFFSER"]  # tcode 5: dlog, leads with NaN
-    assert pd.isna(logdiff.iloc[0])
-    assert logdiff.iloc[1] == pytest.approx(0.09531, abs=1e-4)
+    assert logdiff[0] is None
+    assert logdiff[1] == pytest.approx(0.09531, abs=1e-4)
 
 
 def test_specific_vintage_individual_adds_column():
     """A recent vintage (hosted individually) gets a 'vintage' column after 'date'."""
     with _patch():
         result = _download_data_fred_md("FRED-MD", vintage="2026-01")
-    assert list(result.columns[:2]) == ["date", "vintage"]
-    assert result["vintage"].unique().tolist() == ["2026-01"]
+    assert result.columns[:2] == ["date", "vintage"]
+    assert result["vintage"].unique().to_list() == ["2026-01"]
 
 
 def test_vintage_extracted_from_archive():
@@ -112,7 +113,7 @@ def test_vintage_extracted_from_archive():
     files = {"2020-03.csv": _CSV}
     with _patch(zip_files=files, fail_csv=True):
         result = _download_data_fred_md("FRED-MD", vintage="2020-03")
-    assert result["vintage"].unique().tolist() == ["2020-03"]
+    assert result["vintage"].unique().to_list() == ["2020-03"]
     assert "LEVELSER" in result.columns
 
 
@@ -123,7 +124,7 @@ def test_all_stacks_vintages_wide():
         zip_files=files, fail_csv=True
     ):  # recent individual pulls all fail
         result = _download_data_fred_md("FRED-MD", vintage="all")
-    assert list(result.columns[:2]) == ["date", "vintage"]
+    assert result.columns[:2] == ["date", "vintage"]
     assert sorted(result["vintage"].unique()) == ["2020-01", "2020-02"]
 
 

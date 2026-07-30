@@ -1,10 +1,11 @@
 """Tests for download_data_jkp and list_supported_jkp_factors."""
 
+import datetime as dt
 import os
 import sys
 from unittest.mock import patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -35,12 +36,12 @@ def _manifest():
 
 
 def test_downloads_and_processes_monthly_factor_returns():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
-            "location": "usa",
-            "name": "mkt",
-            "freq": "monthly",
-            "weighting": "vw_cap",
+            "location": ["usa", "usa"],
+            "name": ["mkt", "mkt"],
+            "freq": ["monthly", "monthly"],
+            "weighting": ["vw_cap", "vw_cap"],
             "n_stocks": [494, 505],
             "date": ["1926-01-31", "1926-02-28"],
             "ret": [0.001, -0.046],
@@ -58,18 +59,18 @@ def test_downloads_and_processes_monthly_factor_returns():
     ):
         result = _download_data_jkp(region="usa", factors="mkt")
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     # Dates are aligned to the beginning of the month.
-    assert list(result["date"]) == [
-        pd.Timestamp("1926-01-01"),
-        pd.Timestamp("1926-02-01"),
+    assert result["date"].to_list() == [
+        dt.date(1926, 1, 1),
+        dt.date(1926, 2, 1),
     ]
     # Returns are already decimal and must not be rescaled.
-    assert list(result["ret"]) == [0.001, -0.046]
+    assert result["ret"].to_list() == [0.001, -0.046]
 
 
 def test_keeps_daily_dates_as_is():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {"date": ["2020-01-02", "2020-01-03"], "ret": [0.01, 0.02]}
     )
     with (
@@ -86,21 +87,21 @@ def test_keeps_daily_dates_as_is():
             region="usa", factors="mkt", frequency="daily"
         )
 
-    assert list(result["date"]) == [
-        pd.Timestamp("2020-01-02"),
-        pd.Timestamp("2020-01-03"),
+    assert result["date"].to_list() == [
+        dt.date(2020, 1, 2),
+        dt.date(2020, 1, 3),
     ]
 
 
 def test_downloads_portfolios_and_coerces_pf_to_integer():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
-            "location": "usa",
-            "name": "be_me",
+            "location": ["usa", "usa"],
+            "name": ["be_me", "be_me"],
             "pf": [1.0, 3.0],
             "n": [494, 497],
-            "freq": "monthly",
-            "weighting": "vw_cap",
+            "freq": ["monthly", "monthly"],
+            "weighting": ["vw_cap", "vw_cap"],
             "date": ["1926-01-31", "1926-01-31"],
             "ret": [0.001, -0.002],
         }
@@ -117,24 +118,24 @@ def test_downloads_portfolios_and_coerces_pf_to_integer():
     ):
         result = _download_data_jkp(dataset="portfolios", factors="be_me")
 
-    assert result["pf"].dtype.kind == "i"
-    assert list(result["pf"]) == [1, 3]
-    assert list(result["date"]) == [
-        pd.Timestamp("1926-01-01"),
-        pd.Timestamp("1926-01-01"),
+    assert result["pf"].dtype.is_integer()
+    assert result["pf"].to_list() == [1, 3]
+    assert result["date"].to_list() == [
+        dt.date(1926, 1, 1),
+        dt.date(1926, 1, 1),
     ]
 
 
 def test_downloads_industry_returns_at_monthly_frequency():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "gics": [55, 15],
             "date": ["1999-07-31", "1999-07-31"],
             "n": [170, 376],
-            "location": "usa",
+            "location": ["usa", "usa"],
             "ret": [-0.004, -0.036],
-            "freq": "monthly",
-            "weighting": "vw_cap",
+            "freq": ["monthly", "monthly"],
+            "weighting": ["vw_cap", "vw_cap"],
         }
     )
     with (
@@ -149,9 +150,9 @@ def test_downloads_industry_returns_at_monthly_frequency():
     ):
         result = _download_data_jkp(dataset="industry", classification="gics")
 
-    assert list(result["date"]) == [
-        pd.Timestamp("1999-07-01"),
-        pd.Timestamp("1999-07-01"),
+    assert result["date"].to_list() == [
+        dt.date(1999, 7, 1),
+        dt.date(1999, 7, 1),
     ]
     assert "gics" in result.columns
 
@@ -160,7 +161,7 @@ def test_downloads_industry_returns_at_monthly_frequency():
 
 
 def test_downloads_reference_cutoffs_and_renames_eom_to_date():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "eom": ["1925-12-31", "1926-01-31"],
             "n": [495, 508],
@@ -174,9 +175,9 @@ def test_downloads_reference_cutoffs_and_renames_eom_to_date():
 
     assert "date" in result.columns
     assert "eom" not in result.columns
-    assert list(result["date"]) == [
-        pd.Timestamp("1925-12-01"),
-        pd.Timestamp("1926-01-01"),
+    assert result["date"].to_list() == [
+        dt.date(1925, 12, 1),
+        dt.date(1926, 1, 1),
     ]
 
 
@@ -185,7 +186,7 @@ def test_return_cutoffs_selects_the_daily_file_by_frequency():
 
     def fake_download(url, *args, **kwargs):
         captured_url["url"] = url
-        return pd.DataFrame({"eom": ["2020-01-31"], "ret_1": [-0.14]})
+        return pl.DataFrame({"eom": ["2020-01-31"], "ret_1": [-0.14]})
 
     with patch(
         "tidyfinance.download_open_source._download_jkp_csv",
@@ -204,7 +205,7 @@ def test_returns_empty_dataframe_when_a_reference_download_fails():
         with pytest.warns(UserWarning, match="download or parsing failure"):
             result = _download_data_jkp(dataset="nyse_cutoffs")
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
 
 
@@ -212,7 +213,7 @@ def test_returns_empty_dataframe_when_a_reference_download_fails():
 
 
 def test_filters_rows_when_both_dates_are_supplied():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "date": ["2020-01-31", "2020-02-29", "2020-03-31"],
             "ret": [1, 2, 3],
@@ -236,7 +237,7 @@ def test_filters_rows_when_both_dates_are_supplied():
         )
 
     assert len(result) == 1
-    assert result["date"].iloc[0] == pd.Timestamp("2020-02-01")
+    assert result["date"][0] == dt.date(2020, 2, 1)
 
 
 # %% _download_data_jkp: validation errors
@@ -307,7 +308,7 @@ def test_returns_empty_dataframe_when_the_manifest_is_unavailable():
         with pytest.warns(UserWarning, match="download failure"):
             result = _download_data_jkp()
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
 
 
@@ -372,12 +373,12 @@ def test_list_supported_jkp_factors_returns_regions_and_per_region_values():
         return_value=_manifest(),
     ):
         regions = list_supported_jkp_factors()
-        assert isinstance(regions, pd.DataFrame)
-        assert list(regions["region"]) == ["usa", "frontier"]
-        assert "be_me" in list_supported_jkp_factors("usa")["factor"].values
-        assert list(
-            list_supported_jkp_factors("usa", dataset="industry")["factor"]
-        ) == ["gics", "ff49"]
+        assert isinstance(regions, pl.DataFrame)
+        assert regions["region"].to_list() == ["usa", "frontier"]
+        assert "be_me" in list_supported_jkp_factors("usa")["factor"].to_list()
+        assert list_supported_jkp_factors("usa", dataset="industry")[
+            "factor"
+        ].to_list() == ["gics", "ff49"]
         with pytest.raises(ValueError, match="Unsupported"):
             list_supported_jkp_factors("atlantis")
 
@@ -395,7 +396,7 @@ def test_list_supported_jkp_factors_returns_empty_dataframe_on_failure():
         with pytest.warns(UserWarning, match="download failure"):
             result = list_supported_jkp_factors()
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
 
 

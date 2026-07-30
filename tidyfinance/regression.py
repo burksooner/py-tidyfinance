@@ -4,7 +4,7 @@ import re
 import warnings
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from formulaic import model_matrix
 
 
@@ -15,6 +15,8 @@ class _OLSFit:
     ``pyfixest.feols(...)`` for linear models without fixed effects:
     classical (iid) inference with an ``n - k`` degrees-of-freedom
     correction (``sigma^2 * (X'X)^-1`` with ``sigma^2 = RSS / (n - k)``).
+    ``coef``, ``se`` and ``tstat`` return plain dicts keyed by the model
+    term names (insertion-ordered as in the design matrix).
     """
 
     def __init__(
@@ -28,9 +30,9 @@ class _OLSFit:
         adj_r_squared=None,
         n_obs=None,
     ):
-        self._coef = pd.Series(coef, index=names)
-        self._se = pd.Series(se, index=names)
-        self._tstat = pd.Series(tstat, index=names)
+        self._coef = dict(zip(names, (float(v) for v in coef)))
+        self._se = dict(zip(names, (float(v) for v in se)))
+        self._tstat = dict(zip(names, (float(v) for v in tstat)))
         self._resid = resid
         self._r_squared = r_squared
         self._adj_r_squared = adj_r_squared
@@ -58,7 +60,7 @@ class _OLSFit:
         return self._n_obs
 
 
-def _fit_ols(model: str, data: pd.DataFrame) -> _OLSFit:
+def _fit_ols(model: str, data: pl.DataFrame) -> _OLSFit:
     """Fit an OLS model from a formula via formulaic and numpy.
 
     Replaces ``pyfixest.feols`` for the simple regressions used in this
@@ -73,7 +75,7 @@ def _fit_ols(model: str, data: pd.DataFrame) -> _OLSFit:
         A formulaic formula string, e.g. ``'y ~ x1 + x2'``. An
         intercept (named ``'Intercept'``) is included unless ``- 1`` is
         present.
-    data : pd.DataFrame
+    data : pl.DataFrame
         Data containing the formula's variables.
 
     Returns
@@ -81,7 +83,7 @@ def _fit_ols(model: str, data: pd.DataFrame) -> _OLSFit:
     _OLSFit
         Fitted model exposing ``coef``, ``se``, ``tstat`` and ``resid``.
     """
-    y, x = model_matrix(model, data)
+    y, x = model_matrix(model, data.to_pandas())
     names = list(x.columns)
     x_mat = np.asarray(x, dtype=float)
     y_vec = np.asarray(y, dtype=float).ravel()
@@ -118,12 +120,12 @@ def _fit_ols(model: str, data: pd.DataFrame) -> _OLSFit:
 
 
 def estimate_betas(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     model: str,
     lookback: int,
     min_obs: int = None,
     id_col: str = "permno",
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Estimate rolling betas.
 
     Estimates rolling betas for a given model using the provided data.
@@ -143,7 +145,7 @@ def estimate_betas(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Data frame containing the data with a date identifier (defaults
         to 'date'), a stock identifier (defaults to 'permno'), and the
         other variables used in the model.
@@ -162,24 +164,27 @@ def estimate_betas(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Data frame with the estimated betas for each stock and time
         period. Contains one column per model term (the intercept, when
         present, is named 'Intercept'), the stock identifier, and the
         'date' column. Windows with fewer than 'min_obs' observations
-        yield NaN coefficients.
+        yield null coefficients.
 
     Examples
     --------
     ```python
+    from datetime import date
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import estimate_betas
     rng = np.random.default_rng(1234)
-    dates = pd.date_range('2020-01-01', periods=12, freq='MS')
-    data_monthly = pd.DataFrame({
-        'date': np.repeat(dates, 50),
-        'permno': np.tile(range(1, 51), 12),
+    dates = pl.date_range(
+        date(2020, 1, 1), date(2020, 12, 1), "1mo", eager=True
+    )
+    data_monthly = pl.DataFrame({
+        'date': np.repeat(dates.to_numpy(), 50),
+        'permno': np.tile(np.arange(1, 51), 12),
         'ret_excess': rng.normal(0, 0.1, 600),
         'mkt_excess': rng.normal(0, 0.1, 600),
         'smb': rng.normal(0, 0.1, 600),
@@ -198,9 +203,8 @@ def estimate_betas(
     coef_names = (["Intercept"] if has_intercept else []) + regressors
 
     results = []
-    for stock_id, group in data.groupby(id_col):
-        group = group.sort_values("date")
-
+    sorted_data = data.sort([id_col, "date"], maintain_order=True)
+    for group in sorted_data.partition_by(id_col, maintain_order=True):
         betas = _rolling_ols_betas(
             group,
             dep_var,
@@ -209,14 +213,16 @@ def estimate_betas(
             lookback,
             min_obs,
         )
-        betas = pd.DataFrame(betas, columns=coef_names)
-        betas[id_col] = stock_id
-        betas["date"] = group["date"].values
-        results.append(betas)
+        betas_df = pl.from_numpy(betas, schema=coef_names, orient="row")
+        betas_df = betas_df.with_columns(pl.all().fill_nan(None))
+        betas_df = betas_df.with_columns(
+            group.get_column(id_col),
+            group.get_column("date"),
+        )
+        results.append(betas_df)
 
-    betas_df = pd.concat(results, ignore_index=True)
-    betas_df = betas_df[coef_names + [id_col, "date"]]
-    return betas_df
+    betas_df = pl.concat(results)
+    return betas_df.select(coef_names + [id_col, "date"])
 
 
 def _parse_linear_formula(model: str) -> tuple[str, list[str], bool]:
@@ -269,7 +275,7 @@ def _parse_linear_formula(model: str) -> tuple[str, list[str], bool]:
 
 
 def _rolling_ols_betas(
-    group: pd.DataFrame,
+    group: pl.DataFrame,
     dep_var: str,
     regressors: list[str],
     has_intercept: bool,
@@ -291,7 +297,7 @@ def _rolling_ols_betas(
 
     Parameters
     ----------
-    group : pd.DataFrame
+    group : pl.DataFrame
         Per-stock data sorted by date.
     dep_var : str
         Dependent variable column name.
@@ -314,19 +320,22 @@ def _rolling_ols_betas(
         equations are singular, contain NaN. Rows dropped for missing
         data also contain NaN.
     """
-    n_rows = len(group)
+    n_rows = group.height
     k = (1 if has_intercept else 0) + len(regressors)
     betas = np.full((n_rows, k), np.nan)
 
     model_vars = [dep_var] + regressors
-    complete = group[model_vars].notna().all(axis=1).to_numpy()
+    values = group.select(
+        [pl.col(c).cast(pl.Float64) for c in model_vars]
+    ).to_numpy()
+    complete = ~np.isnan(values).any(axis=1)
     pos = np.flatnonzero(complete)
     n = pos.size
     if n == 0:
         return betas
 
-    y = group[dep_var].to_numpy(dtype=float)[pos]
-    x = group[regressors].to_numpy(dtype=float)[pos]
+    y = values[pos, 0]
+    x = values[pos, 1:]
     if has_intercept:
         design = np.column_stack([np.ones(n), x])
     else:
@@ -504,13 +513,13 @@ def _newey_west_se(
 
 
 def estimate_fama_macbeth(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     model: str,
     vcov: str = "newey-west",
     vcov_options: dict | None = None,
     date_col: str = "date",
     detail: bool = False,
-) -> pd.DataFrame | dict:
+) -> pl.DataFrame | dict:
     """Estimate Fama-MacBeth regressions.
 
     Runs one cross-sectional ordinary least squares regression per period
@@ -519,7 +528,7 @@ def estimate_fama_macbeth(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Panel containing the dependent and independent variables named in
         'model' plus a column with the time index. Each (date, unit)
         combination should appear at most once.
@@ -560,7 +569,7 @@ def estimate_fama_macbeth(
 
     Returns
     -------
-    pd.DataFrame or dict
+    pl.DataFrame or dict
         If 'detail' is 'False' (default), a data frame with one row per
         term in 'model' with columns:
 
@@ -602,14 +611,17 @@ def estimate_fama_macbeth(
     Examples
     --------
     ```python
+    from datetime import date
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import estimate_fama_macbeth
     rng = np.random.default_rng(1234)
-    dates = pd.date_range('2020-01-01', periods=12, freq='MS')
-    data = pd.DataFrame({
-        'date': np.repeat(dates, 50),
-        'permno': np.tile(range(1, 51), 12),
+    dates = pl.date_range(
+        date(2020, 1, 1), date(2020, 12, 1), "1mo", eager=True
+    )
+    data = pl.DataFrame({
+        'date': np.repeat(dates.to_numpy(), 50),
+        'permno': np.tile(np.arange(1, 51), 12),
         'ret_excess': rng.normal(0, 0.1, 600),
         'beta': rng.normal(1, 0.2, 600),
         'bm': rng.normal(0.5, 0.1, 600),
@@ -653,17 +665,17 @@ def estimate_fama_macbeth(
     nw_prewhite = int(options.get("prewhite", 1))
     nw_adjust = bool(options.get("adjust", False))
 
-    # Run cross-sectional regressions
-    cross_section_results = []
+    # Run cross-sectional regressions in ascending date order.
+    min_group_size = len(model.split("~")[1].split("+"))
+    cross_section_coefs = []
     cross_section_stats = []
-    for date, group in data.groupby(date_col):
-        if len(group) <= len(model.split("~")[1].split("+")):
+    sorted_data = data.sort(date_col, maintain_order=True)
+    for group in sorted_data.partition_by(date_col, maintain_order=True):
+        if group.height <= min_group_size:
             continue
 
         model_fit = _fit_ols(model, data=group)
-        params = model_fit.coef().to_dict()
-        params[date_col] = date
-        cross_section_results.append(params)
+        cross_section_coefs.append(model_fit.coef())
         cross_section_stats.append(
             {
                 "r_squared": model_fit.r_squared(),
@@ -672,79 +684,68 @@ def estimate_fama_macbeth(
             }
         )
 
-    risk_premiums = pd.DataFrame(cross_section_results)
+    # Compute time-series averages, standard errors, t-statistics, and
+    # period counts per factor under the chosen vcov. Factors are
+    # reported in alphabetical order.
+    factors = sorted({name for coefs in cross_section_coefs for name in coefs})
 
-    # Compute time-series averages
-    price_of_risk = (
-        risk_premiums.melt(
-            id_vars=date_col, var_name="factor", value_name="estimate"
+    factor_col = []
+    premium_col = []
+    se_col = []
+    t_col = []
+    n_col = []
+    for factor in factors:
+        estimates = np.array(
+            [coefs.get(factor, np.nan) for coefs in cross_section_coefs],
+            dtype=float,
         )
-        .groupby("factor")["estimate"]
-        .mean()
-        .reset_index()
-        .rename(columns={"estimate": "risk_premium"})
-    )
-
-    # Compute standard error, t-statistic, and n per factor under
-    # the chosen vcov.
-    def compute_se_and_t(x):
-        x = x.sort_values(date_col)
-        estimate = x["estimate"].dropna()
-        n = int(estimate.size)
+        estimates = estimates[~np.isnan(estimates)]
+        n = int(estimates.size)
+        risk_premium = float(estimates.mean()) if n > 0 else np.nan
         if n < 2:
-            return pd.Series(
-                {
-                    "standard_error": np.nan,
-                    "t_statistic": np.nan,
-                    "n": n,
-                }
-            )
-        if vcov == "newey-west":
-            se = _newey_west_se(
-                estimate.to_numpy(),
-                lag=nw_lag,
-                prewhite=nw_prewhite,
-                adjust=nw_adjust,
-            )
-        else:
-            se = _fit_ols(
-                "estimate ~ 1", data=x.dropna(subset=["estimate"])
-            ).se()["Intercept"]
-        if se is None or np.isnan(se) or se == 0:
+            se = np.nan
             t_stat = np.nan
         else:
-            t_stat = float(estimate.mean()) / float(se)
-        return pd.Series(
-            {
-                "standard_error": float(se) if se is not None else np.nan,
-                "t_statistic": t_stat,
-                "n": n,
-            }
-        )
+            if vcov == "newey-west":
+                se = _newey_west_se(
+                    estimates,
+                    lag=nw_lag,
+                    prewhite=nw_prewhite,
+                    adjust=nw_adjust,
+                )
+            else:
+                se = _fit_ols(
+                    "estimate ~ 1",
+                    data=pl.DataFrame({"estimate": estimates}),
+                ).se()["Intercept"]
+            if se is None or np.isnan(se) or se == 0:
+                t_stat = np.nan
+            else:
+                t_stat = float(estimates.mean()) / float(se)
+        factor_col.append(factor)
+        premium_col.append(risk_premium)
+        se_col.append(float(se) if se is not None else np.nan)
+        t_col.append(t_stat)
+        n_col.append(n)
 
-    price_of_risk_se_t_n = (
-        risk_premiums.melt(
-            id_vars=date_col, var_name="factor", value_name="estimate"
-        )
-        .groupby("factor")
-        .apply(compute_se_and_t, include_groups=False)
-        .reset_index()
+    result_df = pl.DataFrame(
+        {
+            "factor": pl.Series(factor_col, dtype=pl.String),
+            "risk_premium": pl.Series(premium_col, dtype=pl.Float64),
+            "standard_error": pl.Series(se_col, dtype=pl.Float64),
+            "t_statistic": pl.Series(t_col, dtype=pl.Float64),
+            "n": pl.Series(n_col, dtype=pl.Int64),
+        }
+    ).with_columns(
+        pl.col("risk_premium", "standard_error", "t_statistic").fill_nan(None)
     )
 
-    result_df = price_of_risk.merge(price_of_risk_se_t_n, on="factor")[
-        ["factor", "risk_premium", "standard_error", "t_statistic", "n"]
-    ]
-
     if detail:
-        stats_df = pd.DataFrame(cross_section_stats)
-        summary_statistics = pd.DataFrame(
-            [
-                {
-                    "r_squared": stats_df["r_squared"].mean(),
-                    "adj_r_squared": stats_df["adj_r_squared"].mean(),
-                    "n_obs": stats_df["n_obs"].mean(),
-                }
-            ]
+        stats_df = pl.DataFrame(cross_section_stats)
+        summary_statistics = stats_df.select(
+            pl.col("r_squared").fill_nan(None).mean(),
+            pl.col("adj_r_squared").fill_nan(None).mean(),
+            pl.col("n_obs").mean(),
         )
         return {
             "coefficients": result_df,
@@ -755,7 +756,7 @@ def estimate_fama_macbeth(
 
 
 def estimate_model(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     model: str,
     min_obs: int = 1,
     output="coefficients",
@@ -771,7 +772,7 @@ def estimate_model(
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Data frame containing the dependent variable and one or more
         independent variables.
     model : str
@@ -788,13 +789,14 @@ def estimate_model(
 
     Returns
     -------
-    pd.DataFrame, np.ndarray, or dict
+    pl.DataFrame, np.ndarray, or dict
         If 'output' contains a single value: a data frame of
         coefficients or t-statistics, or a numeric vector of
         residuals. If 'output' contains multiple values: a dict with
         the requested elements. Coefficients and t-statistics are
-        returned as data frames with column names corresponding to the
-        model terms. Residuals are returned as a numeric vector of
+        returned as one-row data frames with column names corresponding
+        to the model terms (all-null when there are not enough
+        observations). Residuals are returned as a numeric vector of
         length 'len(data)' with NaN for rows with missing data or
         insufficient observations.
 
@@ -802,10 +804,10 @@ def estimate_model(
     --------
     ```python
     import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import estimate_model
     rng = np.random.default_rng(42)
-    data = pd.DataFrame({
+    data = pl.DataFrame({
         'ret_excess': rng.standard_normal(100),
         'mkt_excess': rng.standard_normal(100),
         'smb': rng.standard_normal(100),
@@ -871,7 +873,17 @@ def estimate_model(
         )
 
     model_vars = [dep_var] + independent_vars
-    complete = data[model_vars].notna().all(axis=1)
+    mask_exprs = []
+    for var in model_vars:
+        expr = pl.col(var).is_not_null()
+        if data.schema[var].is_float():
+            expr = expr & pl.col(var).is_not_nan()
+        mask_exprs.append(expr)
+    complete = (
+        data.select(pl.all_horizontal(mask_exprs).alias("complete"))
+        .get_column("complete")
+        .to_numpy()
+    )
     n_complete = int(complete.sum())
 
     insufficient = (n_complete < min_obs) or (
@@ -881,20 +893,26 @@ def estimate_model(
     fit = None
     if not insufficient:
         try:
-            fit = _fit_ols(model, data=data[complete])
+            fit = _fit_ols(model, data=data.filter(pl.Series(complete)))
         except Exception:
             insufficient = True
 
-    def to_df(series):
-        renamed = series.rename({"Intercept": "intercept"})
-        return pd.DataFrame([renamed.values], columns=list(renamed.index))
+    def to_df(values):
+        renamed = {
+            ("intercept" if name == "Intercept" else name): value
+            for name, value in values.items()
+        }
+        frame = pl.DataFrame({name: [value] for name, value in renamed.items()})
+        return frame.with_columns(pl.all().fill_nan(None))
 
     def na_df():
         if len(independent_vars) == 0:
             return np.nan
-        return pd.DataFrame(
-            [[np.nan] * len(independent_vars)],
-            columns=independent_vars,
+        return pl.DataFrame(
+            {
+                var: pl.Series([None], dtype=pl.Float64)
+                for var in independent_vars
+            }
         )
 
     result = {}
@@ -916,7 +934,7 @@ def estimate_model(
             result["residuals"] = np.full(len(data), np.nan)
         else:
             resid = np.full(len(data), np.nan)
-            resid[complete.values] = np.asarray(fit.resid())
+            resid[complete] = np.asarray(fit.resid())
             result["residuals"] = resid
 
     if return_multiple:

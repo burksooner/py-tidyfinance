@@ -1,10 +1,11 @@
 """Tests for download_data_stambaugh_yuan."""
 
+import datetime as dt
 import os
 import sys
 from unittest.mock import patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -17,7 +18,7 @@ from tidyfinance.download_open_source import (  # noqa: E402
 
 
 def test_downloads_and_processes_monthly_mispricing_factors():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "YYYYMM": [196301, 196302],
             "MKTRF": [0.0493, -0.0238],
@@ -27,13 +28,11 @@ def test_downloads_and_processes_monthly_mispricing_factors():
             "RF": [0.0025, 0.0023],
         }
     )
-    with patch(
-        "tidyfinance.download_open_source.pd.read_csv", return_value=raw
-    ):
+    with patch("tidyfinance.download_open_source._fetch_csv", return_value=raw):
         result = _download_data_stambaugh_yuan()
 
-    assert isinstance(result, pd.DataFrame)
-    assert list(result.columns) == [
+    assert isinstance(result, pl.DataFrame)
+    assert result.columns == [
         "date",
         "mkt_excess",
         "smb",
@@ -42,21 +41,21 @@ def test_downloads_and_processes_monthly_mispricing_factors():
         "risk_free",
     ]
     # Dates are aligned to the beginning of the month.
-    assert list(result["date"]) == [
-        pd.Timestamp("1963-01-01"),
-        pd.Timestamp("1963-02-01"),
+    assert result["date"].to_list() == [
+        dt.date(1963, 1, 1),
+        dt.date(1963, 2, 1),
     ]
     # Returns are already decimal and must not be rescaled.
-    assert list(result["mkt_excess"]) == [0.0493, -0.0238]
-    assert list(result["risk_free"]) == [0.0025, 0.0023]
+    assert result["mkt_excess"].to_list() == [0.0493, -0.0238]
+    assert result["risk_free"].to_list() == [0.0025, 0.0023]
 
 
 def test_parses_daily_dates_from_the_date_column():
     captured_url = {}
 
-    def fake_read_csv(url, *args, **kwargs):
+    def fake_fetch_csv(url, *args, **kwargs):
         captured_url["url"] = url
-        return pd.DataFrame(
+        return pl.DataFrame(
             {
                 "DATE": [19630102, 19630103],
                 "MKTRF": [-0.0054, 0.0166],
@@ -68,20 +67,20 @@ def test_parses_daily_dates_from_the_date_column():
         )
 
     with patch(
-        "tidyfinance.download_open_source.pd.read_csv",
-        side_effect=fake_read_csv,
+        "tidyfinance.download_open_source._fetch_csv",
+        side_effect=fake_fetch_csv,
     ):
         result = _download_data_stambaugh_yuan(dataset="daily")
 
     assert captured_url["url"].endswith("M4d.csv")
-    assert list(result["date"]) == [
-        pd.Timestamp("1963-01-02"),
-        pd.Timestamp("1963-01-03"),
+    assert result["date"].to_list() == [
+        dt.date(1963, 1, 2),
+        dt.date(1963, 1, 3),
     ]
 
 
 def test_filters_rows_when_both_dates_are_supplied():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "YYYYMM": [196301, 196302, 196303],
             "MKTRF": [1, 2, 3],
@@ -91,19 +90,17 @@ def test_filters_rows_when_both_dates_are_supplied():
             "RF": [1, 2, 3],
         }
     )
-    with patch(
-        "tidyfinance.download_open_source.pd.read_csv", return_value=raw
-    ):
+    with patch("tidyfinance.download_open_source._fetch_csv", return_value=raw):
         result = _download_data_stambaugh_yuan(
             start_date="1963-02-01", end_date="1963-02-28"
         )
 
     assert len(result) == 1
-    assert result["date"].iloc[0] == pd.Timestamp("1963-02-01")
+    assert result["date"][0] == dt.date(1963, 2, 1)
 
 
 def test_warns_when_the_requested_range_is_outside_the_available_data():
-    raw = pd.DataFrame(
+    raw = pl.DataFrame(
         {
             "YYYYMM": [196301, 196302],
             "MKTRF": [1, 2],
@@ -113,15 +110,13 @@ def test_warns_when_the_requested_range_is_outside_the_available_data():
             "RF": [1, 2],
         }
     )
-    with patch(
-        "tidyfinance.download_open_source.pd.read_csv", return_value=raw
-    ):
+    with patch("tidyfinance.download_open_source._fetch_csv", return_value=raw):
         with pytest.warns(UserWarning, match="outside the available"):
             result = _download_data_stambaugh_yuan(
                 start_date="2020-01-01", end_date="2020-12-31"
             )
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
 
 
@@ -132,13 +127,13 @@ def test_aborts_on_unsupported_dataset():
 
 def test_returns_empty_dataframe_after_download_failure():
     with patch(
-        "tidyfinance.download_open_source.pd.read_csv",
+        "tidyfinance.download_open_source._fetch_csv",
         side_effect=Exception("download failure"),
     ):
         with pytest.warns(UserWarning, match="Returning an empty dataset"):
             result = _download_data_stambaugh_yuan()
 
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) == 0
 
 
