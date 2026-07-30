@@ -1,10 +1,11 @@
 """Tests for download_data_wrds_crsp."""
 
+import datetime as dt
 import os
 import sys
 from unittest.mock import patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -69,59 +70,53 @@ def test_deprecated_type_inputs_are_translated_to_dataset():
 
 
 def _mock_monthly_query_result():
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "permno": [1, 1, 2, 3],
-            "date": pd.to_datetime(
-                [
-                    "2020-01-01",
-                    "2020-02-01",
-                    "2020-01-01",
-                    "2020-01-01",
-                ]
-            ),
-            "calculation_date": pd.to_datetime(
-                [
-                    "2020-01-31",
-                    "2020-02-29",
-                    "2020-01-31",
-                    "2020-01-31",
-                ]
-            ),
+            "date": [
+                dt.date(2020, 1, 1),
+                dt.date(2020, 2, 1),
+                dt.date(2020, 1, 1),
+                dt.date(2020, 1, 1),
+            ],
+            "calculation_date": [
+                dt.date(2020, 1, 31),
+                dt.date(2020, 2, 29),
+                dt.date(2020, 1, 31),
+                dt.date(2020, 1, 31),
+            ],
             "ret": [0.10, 0.20, 0.30, 0.40],
             "shrout": [10, 20, 0, 40],
             "prc": [5, 6, 7, 8],
             "primaryexch": ["N", "A", "Q", "Z"],
             "siccd": [5100, 5300, 6500, 9500],
-            "first_crsp_date": pd.to_datetime(["2000-01-01"] * 4),
+            "first_crsp_date": [dt.date(2000, 1, 1)] * 4,
             "mthvol": [11, 12, 13, 14],
         }
     )
 
 
 def _mock_risk_free_monthly():
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
-            "date": pd.to_datetime(["2020-01-01", "2020-02-01"]),
+            "date": [dt.date(2020, 1, 1), dt.date(2020, 2, 1)],
             "risk_free": [0.01, 0.01],
         }
     )
 
 
 def _mock_daily_query_result():
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "permno": [1, 1, 1, 1, 2, 3],
-            "date": pd.to_datetime(
-                [
-                    "2001-01-15",
-                    "2001-02-15",
-                    "2002-02-15",
-                    "2004-02-15",
-                    "2020-01-02",
-                    "2020-01-03",
-                ]
-            ),
+            "date": [
+                dt.date(2001, 1, 15),
+                dt.date(2001, 2, 15),
+                dt.date(2002, 2, 15),
+                dt.date(2004, 2, 15),
+                dt.date(2020, 1, 2),
+                dt.date(2020, 1, 3),
+            ],
             "ret": [0.10, 0.20, 0.30, 0.40, 0.50, None],
             "dlyprc": [10, 10, 10, 10, 0, 8],
             "dlyvol": [20, 18, 16, -99, 5, 6],
@@ -132,18 +127,16 @@ def _mock_daily_query_result():
 
 
 def _mock_risk_free_daily():
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
-            "date": pd.to_datetime(
-                [
-                    "2001-01-15",
-                    "2001-02-15",
-                    "2002-02-15",
-                    "2004-02-15",
-                    "2020-01-02",
-                    "2020-01-03",
-                ]
-            ),
+            "date": [
+                dt.date(2001, 1, 15),
+                dt.date(2001, 2, 15),
+                dt.date(2002, 2, 15),
+                dt.date(2004, 2, 15),
+                dt.date(2020, 1, 2),
+                dt.date(2020, 1, 3),
+            ],
             "risk_free": [0.01] * 6,
         }
     )
@@ -158,9 +151,7 @@ def test_monthly_crsp_v2_is_processed():
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
-        patch(
-            "tidyfinance.download_wrds.pd.read_sql_query", return_value=monthly
-        ),
+        patch("tidyfinance.download_wrds._read_sql", return_value=monthly),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
             return_value=_mock_risk_free_monthly(),
@@ -174,14 +165,14 @@ def test_monthly_crsp_v2_is_processed():
             additional_columns=["mthvol"],
         )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     assert "mthvol" in out.columns
     assert "mktcap" in out.columns
     # Column order must match r-tidyfinance's download_data_wrds_crsp (v2):
     # ..., siccd, <additional_columns>, listing_age, mktcap, mktcap_lag, ...
     # In particular listing_age precedes mktcap (regression test for the
     # swapped columns 9-10 reported in issue #36).
-    assert list(out.columns) == [
+    assert out.columns == [
         "permno",
         "date",
         "calculation_date",
@@ -198,23 +189,22 @@ def test_monthly_crsp_v2_is_processed():
         "industry",
         "ret_excess",
     ]
-    assert out.columns.get_loc("listing_age") < out.columns.get_loc("mktcap")
+    assert out.columns.index("listing_age") < out.columns.index("mktcap")
 
 
 def test_daily_crsp_v2_validates_and_adjusts_volume():
     """Test daily CRSP v2 validates and adjusts volume."""
+    permnos = pl.DataFrame({"permno": [1, 2, 3]})
+
     with (
         patch(
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
         patch(
-            "tidyfinance.download_wrds.pd.read_sql",
-            return_value=pd.DataFrame({"permno": [1, 2, 3]}),
-        ),
-        patch(
-            "tidyfinance.download_wrds.pd.read_sql_query",
-            return_value=_mock_daily_query_result(),
+            "tidyfinance.download_wrds._read_sql",
+            # 1) distinct permnos, 2) the single daily batch query
+            side_effect=[permnos, _mock_daily_query_result()],
         ),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
@@ -253,18 +243,22 @@ def test_daily_crsp_v2_validates_and_adjusts_volume():
 
 def test_daily_crsp_v2_handles_empty_batches():
     """Test daily CRSP v2 handles empty batches."""
+    permnos = pl.DataFrame({"permno": [1, 2, 3]})
+
     with (
         patch(
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
         patch(
-            "tidyfinance.download_wrds.pd.read_sql",
-            return_value=pd.DataFrame({"permno": [1, 2, 3]}),
-        ),
-        patch(
-            "tidyfinance.download_wrds.pd.read_sql_query",
-            return_value=_mock_daily_query_result(),
+            "tidyfinance.download_wrds._read_sql",
+            # 1) distinct permnos, then one query per batch (batch_size=1)
+            side_effect=[
+                permnos,
+                _mock_daily_query_result(),
+                _mock_daily_query_result(),
+                _mock_daily_query_result(),
+            ],
         ),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
@@ -279,19 +273,19 @@ def test_daily_crsp_v2_handles_empty_batches():
             batch_size=1,
         )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     assert len(out) > 0
 
 
 def test_ccm_links_are_added_when_requested():
     """Test CCM links are added when requested."""
     monthly = _mock_monthly_query_result()
-    ccm_links = pd.DataFrame(
+    ccm_links = pl.DataFrame(
         {
             "permno": [1, 1],
             "gvkey": ["001", None],
-            "linkdt": pd.to_datetime(["2019-01-01", "2019-01-01"]),
-            "linkenddt": pd.to_datetime(["2020-12-31", "2020-12-31"]),
+            "linkdt": [dt.date(2019, 1, 1), dt.date(2019, 1, 1)],
+            "linkenddt": [dt.date(2020, 12, 31), dt.date(2020, 12, 31)],
         }
     )
 
@@ -300,9 +294,7 @@ def test_ccm_links_are_added_when_requested():
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
-        patch(
-            "tidyfinance.download_wrds.pd.read_sql_query", return_value=monthly
-        ),
+        patch("tidyfinance.download_wrds._read_sql", return_value=monthly),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
             return_value=_mock_risk_free_monthly(),
@@ -325,10 +317,10 @@ def test_ccm_links_are_added_when_requested():
 
 def _mock_monthly_v1_msf():
     """Mock crsp.msf + msenames join for v1."""
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "permno": [1, 1],
-            "date": pd.to_datetime(["2020-01-15", "2020-02-15"]),
+            "date": [dt.date(2020, 1, 15), dt.date(2020, 2, 15)],
             "ret": [0.10, 0.20],
             "shrout": [10, 10],
             "altprc": [5.0, 5.5],
@@ -341,22 +333,22 @@ def _mock_monthly_v1_msf():
 
 def _mock_monthly_v1_msedelist():
     """Mock crsp.msedelist — empty (no delistings)."""
-    return pd.DataFrame(
-        {
-            "permno": pd.Series([], dtype=int),
-            "dlstdt": pd.Series([], dtype="datetime64[ns]"),
-            "dlret": pd.Series([], dtype=float),
-            "dlstcd": pd.Series([], dtype=float),
+    return pl.DataFrame(
+        schema={
+            "permno": pl.Int64,
+            "dlstdt": pl.Date,
+            "dlret": pl.Float64,
+            "dlstcd": pl.Float64,
         }
     )
 
 
 def _mock_monthly_v1_first_crsp_date():
     """Mock first_crsp_date per permno."""
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "permno": [1],
-            "first_crsp_date": pd.to_datetime(["2000-01-15"]),
+            "first_crsp_date": [dt.date(2000, 1, 15)],
         }
     )
 
@@ -367,21 +359,16 @@ def test_monthly_crsp_v1_is_processed():
     msedelist = _mock_monthly_v1_msedelist()
     first_crsp_date = _mock_monthly_v1_first_crsp_date()
 
-    # Each call to pd.read_sql_query returns the next mock in sequence:
+    # Each call to _read_sql returns the next mock in sequence:
     # 1) msf+msenames query, 2) msedelist, 3) first_crsp_date
-    sql_results = iter([msf_data, msedelist, first_crsp_date])
-
-    def fake_read_sql_query(sql, con, **kwargs):
-        return next(sql_results)
-
     with (
         patch(
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
         patch(
-            "tidyfinance.download_wrds.pd.read_sql_query",
-            side_effect=fake_read_sql_query,
+            "tidyfinance.download_wrds._read_sql",
+            side_effect=[msf_data, msedelist, first_crsp_date],
         ),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
@@ -395,7 +382,7 @@ def test_monthly_crsp_v1_is_processed():
             version="v1",
         )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     assert len(out) > 0
     # Expected v1-specific columns
     assert "mktcap" in out.columns
@@ -410,23 +397,21 @@ def test_monthly_crsp_v1_is_processed():
     # Industry from siccd=5100 -> Wholesale
     assert (out["industry"] == "Wholesale").all()
     # mktcap = |shrout * 1000 * altprc| / 1e6 = |10 * 1000 * 5| / 1e6 = 0.05
-    assert abs(out["mktcap"].iloc[0] - 0.05) < 1e-12
+    assert abs(out["mktcap"][0] - 0.05) < 1e-12
 
 
 def _mock_daily_v1_dsf():
     """Mock crsp.dsf + msenames join for v1."""
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "permno": [1, 1, 1, 1, 2],
-            "date": pd.to_datetime(
-                [
-                    "2001-01-15",
-                    "2001-06-15",
-                    "2002-06-15",
-                    "2004-06-15",
-                    "2020-01-02",
-                ]
-            ),
+            "date": [
+                dt.date(2001, 1, 15),
+                dt.date(2001, 6, 15),
+                dt.date(2002, 6, 15),
+                dt.date(2004, 6, 15),
+                dt.date(2020, 1, 2),
+            ],
             "ret": [0.10, 0.20, 0.30, 0.40, 0.50],
             "prc": [10.0, 12.0, 15.0, 20.0, 25.0],
             "vol": [100, 200, 300, -99, 500],
@@ -437,17 +422,17 @@ def _mock_daily_v1_dsf():
 
 
 def _mock_daily_v1_msedelist():
-    return pd.DataFrame(
-        {
-            "permno": pd.Series([], dtype=int),
-            "dlstdt": pd.Series([], dtype="datetime64[ns]"),
-            "dlret": pd.Series([], dtype=float),
+    return pl.DataFrame(
+        schema={
+            "permno": pl.Int64,
+            "dlstdt": pl.Date,
+            "dlret": pl.Float64,
         }
     )
 
 
 def _mock_daily_v1_permnos():
-    return pd.DataFrame({"permno": [1, 2]})
+    return pl.DataFrame({"permno": [1, 2]})
 
 
 def test_daily_crsp_v1_validates_and_adjusts_volume():
@@ -456,20 +441,14 @@ def test_daily_crsp_v1_validates_and_adjusts_volume():
     dsf = _mock_daily_v1_dsf()
     msedelist = _mock_daily_v1_msedelist()
 
-    sql_query_results = iter([dsf, msedelist])
-
-    def fake_read_sql_query(sql, con, **kw):
-        return next(sql_query_results)
-
     with (
         patch(
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
-        patch("tidyfinance.download_wrds.pd.read_sql", return_value=permnos),
         patch(
-            "tidyfinance.download_wrds.pd.read_sql_query",
-            side_effect=fake_read_sql_query,
+            "tidyfinance.download_wrds._read_sql",
+            side_effect=[permnos, dsf, msedelist],
         ),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
@@ -487,18 +466,16 @@ def test_daily_crsp_v1_validates_and_adjusts_volume():
                 additional_columns=["prc"],
             )
 
-    # Reset iterators for the successful call
-    sql_query_results = iter([dsf, msedelist])
-
+    # Reset the SQL sequence for the successful call:
+    # 1) distinct permnos, 2) the dsf batch query, 3) the batch msedelist
     with (
         patch(
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
-        patch("tidyfinance.download_wrds.pd.read_sql", return_value=permnos),
         patch(
-            "tidyfinance.download_wrds.pd.read_sql_query",
-            side_effect=fake_read_sql_query,
+            "tidyfinance.download_wrds._read_sql",
+            side_effect=[permnos, dsf, msedelist],
         ),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
@@ -515,7 +492,7 @@ def test_daily_crsp_v1_validates_and_adjusts_volume():
             batch_size=500,
         )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     assert "vol_adj" in out.columns
     assert "prc_adj" in out.columns
 
@@ -529,8 +506,8 @@ def test_daily_crsp_v1_handles_empty_batches():
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
         patch(
-            "tidyfinance.download_wrds.pd.read_sql",
-            return_value=pd.DataFrame({"permno": []}),
+            "tidyfinance.download_wrds._read_sql",
+            return_value=pl.DataFrame(schema={"permno": pl.Int64}),
         ),
     ):
         out = _download_data_wrds_crsp(
@@ -541,7 +518,7 @@ def test_daily_crsp_v1_handles_empty_batches():
             batch_size=1,
         )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     assert len(out) == 0
 
 
@@ -558,10 +535,10 @@ def test_crsp_v1_end_date_past_2024_raises():
 def test_crsp_v1_end_date_boundary_2024_12_31_is_allowed():
     """v1 with end_date == 2024-12-31 must not raise the boundary error."""
     # Mocks so the function runs to completion without WRDS access.
-    msf = pd.DataFrame(
+    msf = pl.DataFrame(
         {
             "permno": [1],
-            "date": pd.to_datetime(["2024-12-31"]),
+            "date": [dt.date(2024, 12, 31)],
             "ret": [0.01],
             "shrout": [10],
             "altprc": [5.0],
@@ -570,24 +547,20 @@ def test_crsp_v1_end_date_boundary_2024_12_31_is_allowed():
             "siccd": [5100],
         }
     )
-    msedelist = pd.DataFrame(
-        {
-            "permno": pd.Series([], dtype=int),
-            "dlstdt": pd.Series([], dtype="datetime64[ns]"),
-            "dlret": pd.Series([], dtype=float),
-            "dlstcd": pd.Series([], dtype=float),
+    msedelist = pl.DataFrame(
+        schema={
+            "permno": pl.Int64,
+            "dlstdt": pl.Date,
+            "dlret": pl.Float64,
+            "dlstcd": pl.Float64,
         }
     )
-    first_crsp = pd.DataFrame(
+    first_crsp = pl.DataFrame(
         {
             "permno": [1],
-            "first_crsp_date": pd.to_datetime(["2000-01-15"]),
+            "first_crsp_date": [dt.date(2000, 1, 15)],
         }
     )
-    sql_results = iter([msf, msedelist, first_crsp])
-
-    def fake_read_sql_query(sql, con, **kw):
-        return next(sql_results)
 
     with (
         patch(
@@ -595,8 +568,8 @@ def test_crsp_v1_end_date_boundary_2024_12_31_is_allowed():
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
         patch(
-            "tidyfinance.download_wrds.pd.read_sql_query",
-            side_effect=fake_read_sql_query,
+            "tidyfinance.download_wrds._read_sql",
+            side_effect=[msf, msedelist, first_crsp],
         ),
         patch(
             "tidyfinance.download_wrds._download_data_risk_free",
@@ -611,7 +584,7 @@ def test_crsp_v1_end_date_boundary_2024_12_31_is_allowed():
             version="v1",
         )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
 
 
 if __name__ == "__main__":
