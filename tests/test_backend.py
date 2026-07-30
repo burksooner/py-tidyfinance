@@ -335,14 +335,12 @@ def _panel_with_returns():
     three breakpoints without ties."""
     rng = np.random.default_rng(7)
     n_permnos = 5
-    dates = (
-        pl.date_range(
-            datetime.date(2020, 1, 1),
-            datetime.date(2021, 12, 1),
-            interval="1mo",
-            eager=True,
-        ).to_list()
-    )
+    dates = pl.date_range(
+        datetime.date(2020, 1, 1),
+        datetime.date(2021, 12, 1),
+        interval="1mo",
+        eager=True,
+    ).to_list()
     n = n_permnos * len(dates)
     return pl.DataFrame(
         {
@@ -416,7 +414,7 @@ def test_estimate_betas_round_trips_polars():
     out = tf.estimate_betas(
         _panel_with_returns(),
         model="ret_excess ~ mkt_excess",
-        lookback=12,
+        lookback="12mo",
         min_obs=8,
     )
     assert isinstance(out, pl.DataFrame)

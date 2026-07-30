@@ -193,7 +193,7 @@ def sample_data() -> pl.DataFrame:
 
 
 def test_estimate_rolling_betas_basic(sample_data: pl.DataFrame) -> None:
-    lookback = 30
+    lookback = "30d"
     result = estimate_betas(sample_data, "ret_excess ~ mkt_excess", lookback)
     assert not result.is_empty(), "Result should not be empty"
     assert "beta_mkt_excess" in result.columns, (
@@ -202,7 +202,7 @@ def test_estimate_rolling_betas_basic(sample_data: pl.DataFrame) -> None:
 
 
 def test_estimate_rolling_betas_min_obs(sample_data: pl.DataFrame) -> None:
-    lookback = 30
+    lookback = "30d"
     min_obs = 10
     result = estimate_betas(
         sample_data, "ret_excess ~ mkt_excess", lookback, min_obs=min_obs
@@ -220,7 +220,7 @@ def test_estimate_betas_min_obs_non_positive_raises(
     for bad in (0, -5):
         with pytest.raises(ValueError, match="min_obs must be a positive"):
             estimate_betas(
-                sample_data, "ret_excess ~ mkt_excess", 30, min_obs=bad
+                sample_data, "ret_excess ~ mkt_excess", "30d", min_obs=bad
             )
 
 
@@ -228,13 +228,13 @@ def test_estimate_betas_default_min_obs_is_80_percent(
     sample_data: pl.DataFrame,
 ) -> None:
     """min_obs defaults to 80% of lookback when not provided."""
-    lookback = 30
+    lookback = "30d"
     default = estimate_betas(sample_data, "ret_excess ~ mkt_excess", lookback)
     explicit = estimate_betas(
         sample_data,
         "ret_excess ~ mkt_excess",
         lookback,
-        min_obs=int(lookback * 0.8),
+        min_obs=round(30 * 0.8),
     )
     assert_frame_equal(default, explicit)
 
@@ -243,7 +243,7 @@ def test_estimate_betas_without_intercept_omits_intercept_column(
     sample_data: pl.DataFrame,
 ) -> None:
     """A '- 1' formula omits the intercept column."""
-    result = estimate_betas(sample_data, "ret_excess ~ mkt_excess - 1", 30)
+    result = estimate_betas(sample_data, "ret_excess ~ mkt_excess - 1", "30d")
     assert "intercept" not in result.columns
     assert "beta_mkt_excess" in result.columns
 
@@ -253,8 +253,12 @@ def test_estimate_betas_match_per_window_ols(
 ) -> None:
     """Estimated betas match a per-window OLS fit."""
     lookback = 30
-    result = estimate_betas(sample_data, "ret_excess ~ mkt_excess", lookback)
+    result = estimate_betas(
+        sample_data, "ret_excess ~ mkt_excess", f"{lookback}d"
+    )
 
+    # The fixture has one observation per calendar day, so the 30-day
+    # calendar window is exactly the trailing 30 rows.
     group = sample_data.filter(pl.col("permno") == 1).sort("date")
     i = 50
     window = group.slice(i - lookback + 1, lookback)
@@ -281,7 +285,7 @@ def test_estimate_betas_custom_id_column(
     """A non-default stock identifier column is honored."""
     renamed = sample_data.rename({"permno": "gvkey"})
     result = estimate_betas(
-        renamed, "ret_excess ~ mkt_excess", 30, id_col="gvkey"
+        renamed, "ret_excess ~ mkt_excess", "30d", id_col="gvkey"
     )
     assert "gvkey" in result.columns
     assert "permno" not in result.columns
@@ -292,7 +296,167 @@ def test_estimate_betas_invalid_formula_raises(
 ) -> None:
     """A formula without '~' raises a ValueError."""
     with pytest.raises(ValueError, match="must contain '~'"):
-        estimate_betas(sample_data, "ret_excess mkt_excess", 30)
+        estimate_betas(sample_data, "ret_excess mkt_excess", "30d")
+
+
+# %% estimate_betas: calendar vs positional windows (r-tidyfinance parity)
+
+
+def _gappy_monthly_panel() -> pl.DataFrame:
+    """Monthly panel for one stock with a three-month hole in 2020."""
+    gap = {dt.date(2020, 6, 1), dt.date(2020, 7, 1), dt.date(2020, 8, 1)}
+    keep = [d for d in _month_starts(dt.date(2019, 1, 1), 36) if d not in gap]
+    rng = np.random.default_rng(0)
+    return pl.DataFrame(
+        {
+            "permno": [1] * len(keep),
+            "date": keep,
+            "ret_excess": rng.standard_normal(len(keep)) * 0.05,
+            "mkt_excess": rng.standard_normal(len(keep)) * 0.05,
+        }
+    )
+
+
+def test_calendar_lookback_window_spans_calendar_periods() -> None:
+    """A calendar window covers the trailing N periods, so a gap in the
+    history shrinks the window rather than reaching further back."""
+    data = _gappy_monthly_panel()
+    result = estimate_betas(
+        data, "ret_excess ~ mkt_excess", lookback="12mo", min_obs=5
+    )
+
+    target = dt.date(2020, 12, 1)
+    got = result.filter(pl.col("date") == target)["beta_mkt_excess"][0]
+
+    # 2020-01 through 2020-12 with the three-month gap: nine observations.
+    window = data.filter(pl.col("date").is_between(dt.date(2020, 1, 1), target))
+    assert window.height == 9
+    design = np.column_stack(
+        [np.ones(window.height), window["mkt_excess"].to_numpy()]
+    )
+    expected = np.linalg.lstsq(
+        design, window["ret_excess"].to_numpy(), rcond=None
+    )[0][1]
+    assert got == pytest.approx(expected, rel=1e-10)
+
+
+def test_calendar_and_positional_lookbacks_differ_on_gappy_panels() -> None:
+    """The deprecated positional window reaches past the gap and so
+    gives a different estimate than the calendar window."""
+    data = _gappy_monthly_panel()
+    calendar = estimate_betas(
+        data, "ret_excess ~ mkt_excess", lookback="12mo", min_obs=5
+    )
+    with pytest.warns(DeprecationWarning, match="calendar window"):
+        positional = estimate_betas(
+            data, "ret_excess ~ mkt_excess", lookback=12, min_obs=5
+        )
+
+    target = dt.date(2020, 12, 1)
+    a = calendar.filter(pl.col("date") == target)["beta_mkt_excess"][0]
+    b = positional.filter(pl.col("date") == target)["beta_mkt_excess"][0]
+    assert a != pytest.approx(b, rel=1e-12)
+
+
+def test_calendar_and_positional_agree_on_balanced_panels() -> None:
+    """With one observation per period and no gaps the two windows
+    coincide, which is why the book's monthly examples are unaffected."""
+    dates = _month_starts(dt.date(2020, 1, 1), 36)
+    rng = np.random.default_rng(9)
+    data = pl.DataFrame(
+        {
+            "permno": [1] * 36,
+            "date": dates,
+            "ret_excess": rng.standard_normal(36) * 0.05,
+            "mkt_excess": rng.standard_normal(36) * 0.05,
+        }
+    )
+    calendar = estimate_betas(
+        data, "ret_excess ~ mkt_excess", lookback="12mo", min_obs=10
+    )
+    with pytest.warns(DeprecationWarning):
+        positional = estimate_betas(
+            data, "ret_excess ~ mkt_excess", lookback=12, min_obs=10
+        )
+    assert_frame_equal(calendar, positional)
+
+
+def test_calendar_lookback_pools_observations_within_a_period() -> None:
+    """Daily observations with a monthly window collapse to one row per
+    month, each fitted on every observation in the trailing months."""
+    days = [dt.date(2020, 1, 1) + dt.timedelta(days=i) for i in range(400)]
+    days = [d for d in days if d.weekday() < 5]
+    rng = np.random.default_rng(3)
+    data = pl.DataFrame(
+        {
+            "permno": [1] * len(days),
+            "date": days,
+            "ret_excess": rng.standard_normal(len(days)) * 0.01,
+            "mkt_excess": rng.standard_normal(len(days)) * 0.01,
+        }
+    )
+    result = estimate_betas(
+        data, "ret_excess ~ mkt_excess", lookback="3mo", min_obs=40
+    )
+
+    # One row per month, dated at the start of the month.
+    assert result.height == data["date"].dt.truncate("1mo").n_unique()
+    assert result["date"].to_list() == sorted(result["date"].to_list())
+    assert all(d.day == 1 for d in result["date"].to_list())
+
+    target = dt.date(2020, 6, 1)
+    got = result.filter(pl.col("date") == target)["beta_mkt_excess"][0]
+    window = data.filter(
+        pl.col("date").is_between(dt.date(2020, 4, 1), dt.date(2020, 6, 30))
+    )
+    design = np.column_stack(
+        [np.ones(window.height), window["mkt_excess"].to_numpy()]
+    )
+    expected = np.linalg.lstsq(
+        design, window["ret_excess"].to_numpy(), rcond=None
+    )[0][1]
+    assert got == pytest.approx(expected, rel=1e-10)
+
+
+def test_integer_lookback_is_deprecated(sample_data: pl.DataFrame) -> None:
+    """A bare integer still works but warns."""
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        estimate_betas(sample_data, "ret_excess ~ mkt_excess", 30)
+
+
+def test_invalid_lookback_string_raises(sample_data: pl.DataFrame) -> None:
+    """An unparseable or unsupported duration raises a ValueError."""
+    for bad in ("60", "60y", "sixty", "-3mo", ""):
+        with pytest.raises(ValueError, match="lookback"):
+            estimate_betas(sample_data, "ret_excess ~ mkt_excess", bad)
+
+
+def test_subday_lookback_requires_datetime_column(
+    sample_data: pl.DataFrame,
+) -> None:
+    """An hour/minute/second window needs a datetime date column."""
+    with pytest.raises(ValueError, match="requires a datetime"):
+        estimate_betas(sample_data, "ret_excess ~ mkt_excess", "6h")
+
+
+def test_default_min_obs_rounds_like_r() -> None:
+    """min_obs defaults to round(0.8 * lookback), not the truncation
+    that used to differ from r-tidyfinance (6 -> 5, not 4)."""
+    dates = _month_starts(dt.date(2020, 1, 1), 12)
+    rng = np.random.default_rng(11)
+    data = pl.DataFrame(
+        {
+            "permno": [1] * 12,
+            "date": dates,
+            "ret_excess": rng.standard_normal(12) * 0.05,
+            "mkt_excess": rng.standard_normal(12) * 0.05,
+        }
+    )
+    default = estimate_betas(data, "ret_excess ~ mkt_excess", "6mo")
+    assert_frame_equal(
+        default,
+        estimate_betas(data, "ret_excess ~ mkt_excess", "6mo", min_obs=5),
+    )
 
 
 def sample_data_fmb() -> pl.DataFrame:

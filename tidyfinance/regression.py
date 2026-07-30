@@ -119,10 +119,192 @@ def _fit_ols(model: str, data: pl.DataFrame) -> _OLSFit:
     return _OLSFit(names, beta, se, tstat, resid, r_squared, adj_r_squared, n)
 
 
+# Rolling-window units accepted by 'estimate_betas', mirroring the
+# lubridate Periods that r-tidyfinance's 'estimate_betas' accepts
+# (months, days, hours, minutes, seconds). The keys are the polars
+# duration abbreviations, so '60mo' reads like the '1mo' offsets used
+# elsewhere in the package.
+_LOOKBACK_UNITS = {
+    "mo": "month",
+    "d": "day",
+    "h": "hour",
+    "m": "minute",
+    "s": "second",
+}
+
+_LOOKBACK_TRUNCATE = {
+    "month": "1mo",
+    "day": "1d",
+    "hour": "1h",
+    "minute": "1m",
+    "second": "1s",
+}
+
+_SUBDAY_PERIODS = ("hour", "minute", "second")
+
+_LOOKBACK_RE = re.compile(r"^(\d+)(mo|d|h|m|s)$")
+
+
+def _parse_lookback(lookback) -> tuple[int, str | None]:
+    """Resolve 'lookback' into a window length and a calendar unit.
+
+    A string such as '60mo' selects a calendar window of 60 months,
+    matching r-tidyfinance's 'months(60)'. A bare integer selects the
+    legacy positional window (a count of consecutive observations) and
+    is deprecated.
+
+    Returns
+    -------
+    tuple
+        '(length, period)', where 'period' is one of 'month', 'day',
+        'hour', 'minute', 'second', or 'None' for a positional window.
+    """
+    if isinstance(lookback, bool):
+        raise ValueError("'lookback' must be a duration string or integer.")
+
+    if isinstance(lookback, str):
+        match = _LOOKBACK_RE.match(lookback)
+        if match is None:
+            raise ValueError(
+                f"Invalid 'lookback' {lookback!r}. Use a positive count "
+                "followed by one of 'mo', 'd', 'h', 'm', 's' (e.g. "
+                "'60mo' for 60 months), mirroring r-tidyfinance's "
+                "months(60)."
+            )
+        length = int(match.group(1))
+        if length <= 0:
+            raise ValueError("'lookback' must be a positive duration.")
+        return length, _LOOKBACK_UNITS[match.group(2)]
+
+    if isinstance(lookback, int):
+        if lookback <= 0:
+            raise ValueError("'lookback' must be positive.")
+        warnings.warn(
+            "Passing 'lookback' as an integer counts consecutive "
+            "observations, which differs from r-tidyfinance's calendar "
+            "window and is deprecated. Pass a duration string such as "
+            "'60mo' to roll over calendar periods as R does.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return lookback, None
+
+    raise ValueError(
+        "'lookback' must be a duration string (e.g. '60mo') or an "
+        f"integer; got {type(lookback).__name__}."
+    )
+
+
+def _period_index_expr(date_col: str, period: str) -> pl.Expr:
+    """Integer counter that advances by one per calendar period.
+
+    Mirrors r-tidyfinance's 'period_to_index': months are indexed as
+    'year * 12 + month' rather than by date, which sidesteps
+    end-of-month arithmetic.
+    """
+    col = pl.col(date_col)
+    if period == "month":
+        return col.dt.year() * 12 + col.dt.month()
+    if period == "day":
+        return col.cast(pl.Date).cast(pl.Int64)
+    seconds = col.dt.epoch("s")
+    if period == "hour":
+        return seconds // 3600
+    if period == "minute":
+        return seconds // 60
+    return seconds
+
+
+def _rolling_moment_betas(
+    design: np.ndarray,
+    y: np.ndarray,
+    index: np.ndarray,
+    lookback: int,
+    min_obs: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rolling closed-form OLS over a non-decreasing integer index.
+
+    Observations that share an index value are pooled into a single
+    window position, as r-tidyfinance does when it collapses the
+    cumulants to one row per entity and period before rolling. Because
+    the Gram matrix 'X'X' and the moment vector 'X'y' are additive
+    across observations, pooling does not change any estimate; it only
+    determines where windows begin and end.
+
+    For each distinct index value 'v', the window spans every
+    observation whose index lies in '[v - lookback + 1, v]'. Passing
+    'index = arange(n)' therefore reproduces a positional window of
+    'lookback' consecutive observations.
+
+    Parameters
+    ----------
+    design : np.ndarray
+        '(n, k)' complete-case design matrix.
+    y : np.ndarray
+        '(n,)' response vector.
+    index : np.ndarray
+        '(n,)' non-decreasing integer window index.
+    lookback : int
+        Window length in index units.
+    min_obs : int
+        Minimum number of observations required in a window.
+
+    Returns
+    -------
+    tuple
+        '(start, betas)' where 'start' holds, for each distinct index
+        value, the position of its first observation, and 'betas' is
+        the matching '(m, k)' coefficient matrix. Windows with fewer
+        than 'min_obs' observations, or with singular normal equations,
+        contain NaN.
+    """
+    n, k = design.shape
+
+    # Per-observation cross-products: the Gram matrix X'X is the sum of
+    # the outer products of each design row, and X'y the sum of each row
+    # scaled by y. Cumulative sums let any window be recovered by
+    # differencing two prefix sums.
+    gram_rows = design[:, :, None] * design[:, None, :]  # (n, k, k)
+    moment_rows = design * y[:, None]  # (n, k)
+
+    uniq, start = np.unique(index, return_index=True)
+    m = uniq.size
+    counts = np.diff(np.append(start, n))
+
+    # Pool observations sharing an index value, then prefix-sum.
+    gram_pooled = np.add.reduceat(gram_rows, start, axis=0)
+    moment_pooled = np.add.reduceat(moment_rows, start, axis=0)
+
+    gram_prefix = np.zeros((m + 1, k, k))
+    gram_prefix[1:] = np.cumsum(gram_pooled, axis=0)
+    moment_prefix = np.zeros((m + 1, k))
+    moment_prefix[1:] = np.cumsum(moment_pooled, axis=0)
+    count_prefix = np.zeros(m + 1, dtype=np.int64)
+    count_prefix[1:] = np.cumsum(counts)
+
+    # The window opens at the first index value not older than
+    # 'v - lookback + 1'; this is what slider::slide_index_sum does.
+    lo = np.searchsorted(uniq, uniq - lookback + 1, side="left")
+    hi = np.arange(m) + 1
+    n_window = count_prefix[hi] - count_prefix[lo]
+
+    betas = np.full((m, k), np.nan)
+    for j in np.flatnonzero(n_window >= min_obs):
+        try:
+            betas[j] = np.linalg.solve(
+                gram_prefix[j + 1] - gram_prefix[lo[j]],
+                moment_prefix[j + 1] - moment_prefix[lo[j]],
+            )
+        except np.linalg.LinAlgError:
+            pass
+
+    return start, betas
+
+
 def estimate_betas(
     data: pl.DataFrame,
     model: str,
-    lookback: int,
+    lookback,
     min_obs: int = None,
     id_col: str = "permno",
 ) -> pl.DataFrame:
@@ -130,7 +312,8 @@ def estimate_betas(
 
     Estimates rolling betas for a given model using the provided data.
     For each stock, the regression specified by 'model' is fit over a
-    rolling window of 'lookback' consecutive observations.
+    rolling calendar window of length 'lookback' (e.g. '"60mo"' for
+    sixty months), matching r-tidyfinance's 'estimate_betas'.
 
     The estimator avoids refitting a full regression for every window.
     Instead it accumulates the per-observation cross-products that
@@ -153,12 +336,22 @@ def estimate_betas(
         Formula describing the model to be estimated (e.g.,
         'ret_excess ~ mkt_excess + hml + smb'). An intercept is
         included unless the formula ends in '- 1' (or '+ 0').
-    lookback : int
-        Rolling window size in number of consecutive per-stock
-        observations.
+    lookback : str or int
+        Rolling window length. Pass a duration string — a positive
+        count followed by one of '"mo"' (months), '"d"' (days),
+        '"h"', '"m"', '"s"' — to roll over calendar periods, e.g.
+        '"60mo"'. This mirrors r-tidyfinance's 'months(60)': the window
+        for a period 'v' spans every observation falling in the
+        'lookback' periods ending at 'v', so gaps in a stock's history
+        consume window space, and one row is returned per stock and
+        period. Sub-day units require a datetime column.
+
+        Passing a plain integer selects the legacy behaviour — a window
+        of that many consecutive observations, one output row per input
+        row — and emits a 'DeprecationWarning'.
     min_obs : int, optional
         Minimum number of observations required to estimate the model.
-        Defaults to 80% of 'lookback'.
+        Defaults to 'round(0.8 * lookback)', as in r-tidyfinance.
     id_col : str, default 'permno'
         Column name representing the stock identifier.
 
@@ -172,6 +365,11 @@ def estimate_betas(
         per regressor, matching r-tidyfinance's 'estimate_betas'.
         Windows with fewer than 'min_obs' observations yield null
         coefficients.
+
+        With a calendar 'lookback' there is one row per stock and
+        period, and 'date' is floored to the start of the period. With
+        the deprecated integer 'lookback' there is one row per input
+        row, and 'date' is the observation's own date.
 
     Examples
     --------
@@ -192,11 +390,16 @@ def estimate_betas(
         'smb': rng.normal(0, 0.1, 600),
         'hml': rng.normal(0, 0.1, 600),
     })
-    estimate_betas(data_monthly, 'ret_excess ~ mkt_excess', lookback=3)
+    estimate_betas(data_monthly, 'ret_excess ~ mkt_excess', lookback='3mo')
     ```
     """
+    length, period = _parse_lookback(lookback)
+
     if min_obs is None:
-        min_obs = int(lookback * 0.8)
+        # r-tidyfinance rounds; truncating here used to make the default
+        # differ from R whenever 0.8 * lookback had a fractional part
+        # of .6 or .8 (e.g. lookback 6 gave 4 instead of 5).
+        min_obs = int(round(length * 0.8))
     elif min_obs <= 0:
         raise ValueError("min_obs must be a positive integer.")
 
@@ -208,27 +411,106 @@ def estimate_betas(
         f"beta_{name}" for name in regressors
     ]
 
+    if period in _SUBDAY_PERIODS and data.schema["date"] == pl.Date:
+        raise ValueError(
+            f"A '{period}' lookback requires a datetime 'date' column; "
+            "got a date column."
+        )
+
+    model_vars = [dep_var] + regressors
+    n_coefs = len(coef_names)
+
     results = []
     sorted_data = data.sort([id_col, "date"], maintain_order=True)
     for group in sorted_data.partition_by(id_col, maintain_order=True):
-        betas = _rolling_ols_betas(
-            group,
-            dep_var,
-            regressors,
-            has_intercept,
-            lookback,
-            min_obs,
-        )
-        betas_df = pl.from_numpy(betas, schema=coef_names, orient="row")
-        betas_df = betas_df.with_columns(pl.all().fill_nan(None))
-        betas_df = betas_df.with_columns(
-            group.get_column(id_col),
-            group.get_column("date"),
-        )
-        results.append(betas_df)
+        values = group.select(
+            [pl.col(c).cast(pl.Float64) for c in model_vars]
+        ).to_numpy()
+        complete = ~np.isnan(values).any(axis=1)
+        pos = np.flatnonzero(complete)
 
-    betas_df = pl.concat(results)
-    return betas_df.select([id_col, "date"] + coef_names)
+        if pos.size == 0:
+            if period is None:
+                # Keep one (all-null) output row per input row.
+                results.append(
+                    _betas_frame(
+                        group.get_column(id_col),
+                        group.get_column("date"),
+                        np.full((group.height, n_coefs), np.nan),
+                        coef_names,
+                    )
+                )
+            continue
+
+        y = values[pos, 0]
+        x = values[pos, 1:]
+        if has_intercept:
+            design = np.column_stack([np.ones(pos.size), x])
+        else:
+            design = x.reshape(pos.size, -1)
+
+        if period is None:
+            index = np.arange(pos.size)
+        else:
+            index = (
+                group.select(_period_index_expr("date", period).alias("_i"))
+                .get_column("_i")
+                .to_numpy()[pos]
+            )
+
+        start, betas = _rolling_moment_betas(design, y, index, length, min_obs)
+
+        if period is None:
+            # Realign to every input row; rows dropped for missing data
+            # stay null.
+            full = np.full((group.height, n_coefs), np.nan)
+            full[pos[start]] = betas
+            results.append(
+                _betas_frame(
+                    group.get_column(id_col),
+                    group.get_column("date"),
+                    full,
+                    coef_names,
+                )
+            )
+        else:
+            # One row per period, dated at the start of that period.
+            period_dates = (
+                group.get_column("date")
+                .dt.truncate(_LOOKBACK_TRUNCATE[period])
+                .gather(pos)
+                .gather(start)
+            )
+            results.append(
+                _betas_frame(
+                    group.get_column(id_col).gather(pos).gather(start),
+                    period_dates,
+                    betas,
+                    coef_names,
+                )
+            )
+
+    if not results:
+        return pl.DataFrame(
+            schema={
+                id_col: data.schema[id_col],
+                "date": data.schema["date"],
+                **{name: pl.Float64 for name in coef_names},
+            }
+        )
+
+    return pl.concat(results).select([id_col, "date"] + coef_names)
+
+
+def _betas_frame(
+    ids: pl.Series,
+    dates: pl.Series,
+    betas: np.ndarray,
+    coef_names: list[str],
+) -> pl.DataFrame:
+    """Assemble one group's coefficients into a frame with nulls."""
+    frame = pl.from_numpy(betas, schema=coef_names, orient="row")
+    return frame.with_columns(pl.all().fill_nan(None)).with_columns(ids, dates)
 
 
 def _parse_linear_formula(model: str) -> tuple[str, list[str], bool]:
@@ -278,101 +560,6 @@ def _parse_linear_formula(model: str) -> tuple[str, list[str], bool]:
         regressors.append(tok)
 
     return dep_var, regressors, has_intercept
-
-
-def _rolling_ols_betas(
-    group: pl.DataFrame,
-    dep_var: str,
-    regressors: list[str],
-    has_intercept: bool,
-    lookback: int,
-    min_obs: int,
-) -> np.ndarray:
-    """Rolling OLS coefficients via cumulative cross-product sums.
-
-    Computes, for every row 'i' of 'group' (assumed sorted in time),
-    the OLS coefficients of 'dep_var' on 'regressors' over the window of
-    up to 'lookback' consecutive rows ending at 'i'. Rows containing
-    missing values in the model variables are dropped before windowing.
-
-    Rather than refitting a regression per window, the routine forms the
-    per-observation design Gram matrix 'X'X' and moment vector 'X'y',
-    accumulates them with cumulative sums, differences those to obtain
-    the windowed normal equations, and solves each small system. The
-    coefficients are therefore identical to ordinary least squares.
-
-    Parameters
-    ----------
-    group : pl.DataFrame
-        Per-stock data sorted by date.
-    dep_var : str
-        Dependent variable column name.
-    regressors : list of str
-        Regressor column names.
-    has_intercept : bool
-        Whether to prepend an intercept column.
-    lookback : int
-        Rolling window length in observations.
-    min_obs : int
-        Minimum number of observations required in a window.
-
-    Returns
-    -------
-    np.ndarray
-        Array of shape '(len(group), k)' with the estimated
-        coefficients aligned to the original rows of 'group', where 'k'
-        counts the intercept (if any) plus the regressors. Rows whose
-        window has fewer than 'min_obs' observations, or whose normal
-        equations are singular, contain NaN. Rows dropped for missing
-        data also contain NaN.
-    """
-    n_rows = group.height
-    k = (1 if has_intercept else 0) + len(regressors)
-    betas = np.full((n_rows, k), np.nan)
-
-    model_vars = [dep_var] + regressors
-    values = group.select(
-        [pl.col(c).cast(pl.Float64) for c in model_vars]
-    ).to_numpy()
-    complete = ~np.isnan(values).any(axis=1)
-    pos = np.flatnonzero(complete)
-    n = pos.size
-    if n == 0:
-        return betas
-
-    y = values[pos, 0]
-    x = values[pos, 1:]
-    if has_intercept:
-        design = np.column_stack([np.ones(n), x])
-    else:
-        design = x if x.ndim == 2 else x.reshape(n, 0)
-
-    # Per-observation cross-products: the Gram matrix X'X is the sum of
-    # the outer products of each design row, and X'y the sum of each row
-    # scaled by y. Cumulative sums let any window be recovered by
-    # differencing two prefix sums.
-    gram_rows = design[:, :, None] * design[:, None, :]  # (n, k, k)
-    moment_rows = design * y[:, None]  # (n, k)
-
-    gram_prefix = np.zeros((n + 1, k, k))
-    gram_prefix[1:] = np.cumsum(gram_rows, axis=0)
-    moment_prefix = np.zeros((n + 1, k))
-    moment_prefix[1:] = np.cumsum(moment_rows, axis=0)
-
-    i = np.arange(n)
-    lo = np.maximum(0, i - lookback + 1)
-    count = i + 1 - lo
-
-    gram_win = gram_prefix[i + 1] - gram_prefix[lo]  # (n, k, k)
-    moment_win = moment_prefix[i + 1] - moment_prefix[lo]  # (n, k)
-
-    for j in np.flatnonzero(count >= min_obs):
-        try:
-            betas[pos[j]] = np.linalg.solve(gram_win[j], moment_win[j])
-        except np.linalg.LinAlgError:
-            pass
-
-    return betas
 
 
 def _ar1_ols_residuals(e: np.ndarray) -> tuple[float, np.ndarray]:
