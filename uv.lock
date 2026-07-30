@@ -524,17 +524,6 @@ wheels = [
 ]
 
 [[package]]
-name = "dotenv"
-version = "0.9.9"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "python-dotenv" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/b7/545d2c10c1fc15e48653c91efde329a790f2eecfbbf2bd16003b5db2bab0/dotenv-0.9.9-py2.py3-none-any.whl", hash = "sha256:29cf74a087b31dafdb5a446b6d7e11cbce8ed2741540e2339c69fbef92c94ce9", size = 1892, upload-time = "2025-02-19T22:15:01.647Z" },
-]
-
-[[package]]
 name = "executing"
 version = "2.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2754,22 +2743,23 @@ version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "curl-cffi" },
-    { name = "dotenv" },
     { name = "formulaic" },
-    { name = "lxml" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
     { name = "polars" },
     { name = "psycopg2-binary" },
     { name = "pyarrow" },
-    { name = "requests" },
+    { name = "python-dotenv" },
     { name = "sqlalchemy" },
 ]
 
 [package.optional-dependencies]
 polars = [
     { name = "polars" },
+]
+scraping = [
+    { name = "lxml" },
 ]
 
 [package.dev-dependencies]
@@ -2786,19 +2776,18 @@ docs = [
 [package.metadata]
 requires-dist = [
     { name = "curl-cffi", specifier = ">=0.10.0" },
-    { name = "dotenv", specifier = ">=0.9.9" },
     { name = "formulaic", specifier = ">=1.0.0" },
-    { name = "lxml", specifier = ">=5.3.1" },
+    { name = "lxml", marker = "extra == 'scraping'", specifier = ">=5.3.1" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pandas", specifier = ">=2.2.0" },
     { name = "polars", specifier = ">=1.0.0" },
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.0.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.9" },
     { name = "pyarrow", specifier = ">=19.0.1" },
-    { name = "requests", specifier = ">=2.32.4" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.21" },
 ]
-provides-extras = ["polars"]
+provides-extras = ["polars", "scraping"]
 
 [package.metadata.requires-dev]
 dev = [

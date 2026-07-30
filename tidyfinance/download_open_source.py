@@ -112,8 +112,9 @@ def get_available_famafrench_datasets():
         from lxml.html import document_fromstring
     except Exception:
         raise ImportError(
-            "Please install lxml if you want to use the "
-            "get_datasets_famafrench function"
+            "get_available_famafrench_datasets requires the optional "
+            "'lxml' package. Install it via "
+            "'pip install tidyfinance[scraping]' or 'pip install lxml'."
         )
 
     response = requests.get(f"{ff_url}data_library.html")
