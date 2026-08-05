@@ -176,6 +176,26 @@ def test_min_size_quantile_removes_below_nyse_quantile_stocks_messages():
     assert len(out) < len(data)
 
 
+def test_min_size_quantile_treats_nan_as_missing():
+    """Float NaN in mktcap_lag is treated as missing: it neither
+    shifts the NYSE quantile cutoff nor passes the size filter."""
+    data = pl.DataFrame(
+        {
+            "permno": [1, 2, 3, 4],
+            "date": [dt.date(2020, 1, 1)] * 4,
+            "exchange": ["NYSE"] * 4,
+            "mktcap_lag": [1.0, 2.0, float("nan"), 4.0],
+        }
+    )
+    out = filter_sorting_data(
+        data,
+        filter_options=filter_options(min_size_quantile=0.5),
+        quiet=True,
+    )
+    # Cutoff from [1, 2, 4] (median 2.0); the NaN row is dropped.
+    assert out["permno"].to_list() == [2, 4]
+
+
 def test_min_size_quantile_emits_no_message_when_no_rows_are_removed():
     """Test min_size_quantile emits no message when no rows are removed."""
     # All rows are at or above the lowest NYSE size cutoff -> no removal

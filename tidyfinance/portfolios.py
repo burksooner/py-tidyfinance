@@ -1908,6 +1908,22 @@ def filter_sorting_data(
             "earnings": "ib",
         }
 
+    # Treat float NaN as missing in the filter columns (polars-native
+    # inputs can carry NaN, which would otherwise pass the filters and
+    # shift quantile cutoffs).
+    nan_cols = list(
+        dict.fromkeys(
+            data_options[key]
+            for key in ("mktcap_lag", "price", "be", "earnings")
+            if data_options.get(key) in data.columns
+            and data.schema[data_options[key]] in (pl.Float32, pl.Float64)
+        )
+    )
+    if nan_cols:
+        data = data.with_columns(
+            [pl.col(c).fill_nan(None) for c in nan_cols]
+        )
+
     # exclude_financials / exclude_utilities (share the SIC column)
     if filter_options.get("exclude_financials") or filter_options.get(
         "exclude_utilities"
