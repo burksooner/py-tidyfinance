@@ -168,7 +168,7 @@ def test_monthly_crsp_v2_is_processed():
     assert isinstance(out, pl.DataFrame)
     assert "mthvol" in out.columns
     assert "mktcap" in out.columns
-    # Column order must match r-tidyfinance's download_data_wrds_crsp (v2):
+    # Expected column order (v2):
     # ..., siccd, <additional_columns>, listing_age, mktcap, mktcap_lag, ...
     # In particular listing_age precedes mktcap (regression test for the
     # swapped columns 9-10 reported in issue #36).
@@ -398,6 +398,26 @@ def test_monthly_crsp_v1_is_processed():
     assert (out["industry"] == "Wholesale").all()
     # mktcap = |shrout * 1000 * altprc| / 1e6 = |10 * 1000 * 5| / 1e6 = 0.05
     assert abs(out["mktcap"][0] - 0.05) < 1e-12
+
+
+def test_read_sql_casts_decimal_columns_to_float():
+    """Postgres 'numeric' columns arrive as pl.Decimal and must be
+    normalized to Float64 for downstream arithmetic."""
+    from decimal import Decimal
+
+    from tidyfinance.download_wrds import _read_sql
+
+    decimal_frame = pl.DataFrame(
+        {
+            "permno": [1, 2],
+            "amount": [Decimal("1.50"), Decimal("2.25")],
+        }
+    )
+    with patch("polars.read_database", return_value=decimal_frame):
+        out = _read_sql("SELECT 1", "con")
+
+    assert out.schema["amount"] == pl.Float64
+    assert out["amount"].to_list() == [1.5, 2.25]
 
 
 def test_monthly_crsp_v1_ccm_links_with_float_permno():

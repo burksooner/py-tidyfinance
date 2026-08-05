@@ -35,9 +35,21 @@ def _read_sql(query, con) -> pl.DataFrame:
     Returns
     -------
     pl.DataFrame
-        The query result.
+        The query result. Postgres 'numeric' columns (inferred as
+        'pl.Decimal') are cast to Float64, since downstream arithmetic
+        and checks like 'is_infinite' expect floats.
     """
-    return pl.read_database(query, con, infer_schema_length=None)
+    out = pl.read_database(query, con, infer_schema_length=None)
+    decimal_cols = [
+        name
+        for name, dtype in out.schema.items()
+        if isinstance(dtype, pl.Decimal)
+    ]
+    if decimal_cols:
+        out = out.with_columns(
+            [pl.col(c).cast(pl.Float64) for c in decimal_cols]
+        )
+    return out
 
 
 def _cast_date_columns(df: pl.DataFrame, columns) -> pl.DataFrame:
