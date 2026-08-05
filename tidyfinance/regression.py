@@ -711,6 +711,7 @@ def estimate_fama_macbeth(
     vcov: str = "newey-west",
     vcov_options: dict | None = None,
     date_col: str = "date",
+    data_options: dict | None = None,
     detail: bool = False,
 ) -> pl.DataFrame | dict:
     """Estimate Fama-MacBeth regressions.
@@ -753,6 +754,10 @@ def estimate_fama_macbeth(
     date_col : str, default 'date'
         Column in 'data' identifying the time index for cross-sectional
         regressions.
+    data_options : dict, optional
+        Column-name mapping (see 'data_options'). The 'date' element is
+        used to specify the date column, overriding 'date_col'. Uses
+        the 'data_options' default when None: 'date' -> 'date'.
     detail : bool, default False
         If 'False' (default), return only the coefficient estimates. If
         'True', return a dict with two keys: 'coefficients' (the usual
@@ -787,8 +792,11 @@ def estimate_fama_macbeth(
     Raises
     ------
     ValueError
-        If 'vcov' is not 'iid' or 'newey-west', or if 'date_col' is
-        missing from 'data'.
+        If 'vcov' is not 'iid' or 'newey-west', if 'vcov_options'
+        contains an unrecognized key, if 'date_col' is missing from
+        'data', or if any date grouping has too few rows to estimate
+        the cross-sectional coefficients (each grouping needs more
+        rows than the number of variables in 'model').
 
     References
     ----------
@@ -839,6 +847,9 @@ def estimate_fama_macbeth(
     )
     ```
     """
+    if data_options is not None:
+        date_col = data_options.get("date", date_col)
+
     if vcov not in ["iid", "newey-west"]:
         raise ValueError("vcov must be either 'iid' or 'newey-west'.")
 
@@ -858,18 +869,31 @@ def estimate_fama_macbeth(
         )
         options.setdefault("lag", options.pop("maxlags"))
         options.setdefault("prewhite", 0)
+    unrecognized = sorted(set(options) - {"lag", "prewhite", "adjust"})
+    if unrecognized:
+        raise ValueError(
+            f"Unrecognized vcov_options key(s): {', '.join(unrecognized)}. "
+            "Recognized keys: 'lag', 'prewhite', 'adjust'."
+        )
     nw_lag = options.get("lag", None)
     nw_prewhite = int(options.get("prewhite", 1))
     nw_adjust = bool(options.get("adjust", False))
 
-    # Run cross-sectional regressions in ascending date order.
-    min_group_size = len(model.split("~")[1].split("+"))
+    # Run cross-sectional regressions in ascending date order. Every
+    # date grouping must have more rows than the number of variables
+    # in the model (dependent variable included).
+    dep_var, regressors, _ = _parse_linear_formula(model)
+    n_model_vars = len(dict.fromkeys([dep_var, *regressors]))
     cross_section_coefs = []
     cross_section_stats = []
     sorted_data = data.sort(date_col, maintain_order=True)
     for group in sorted_data.partition_by(date_col, maintain_order=True):
-        if group.height <= min_group_size:
-            continue
+        if group.height <= n_model_vars:
+            raise ValueError(
+                "Each date grouping must have more rows than the number "
+                "of predictors in the model to estimate coefficients. "
+                "Please check your data."
+            )
 
         model_fit = _fit_ols(model, data=group)
         cross_section_coefs.append(model_fit.coef())

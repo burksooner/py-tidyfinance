@@ -511,6 +511,45 @@ def test_estimate_fama_macbeth_missing_date_column_raises() -> None:
         estimate_fama_macbeth(data, "ret_excess ~ beta + bm + log_mktcap")
 
 
+def test_estimate_fama_macbeth_small_cross_section_raises() -> None:
+    """A date grouping with too few rows raises a ValueError.
+
+    Every date grouping must have more rows than the number of
+    variables in the model (dependent variable included); the model
+    below has 4 variables, so a 4-row cross-section fails.
+    """
+    data = sample_data_fmb().filter(
+        (pl.col("date") != pl.col("date").min()) | (pl.col("permno") < 4)
+    )
+    with pytest.raises(ValueError, match="more rows than the number"):
+        estimate_fama_macbeth(data, "ret_excess ~ beta + bm + log_mktcap")
+
+
+def test_estimate_fama_macbeth_data_options_date_column() -> None:
+    """data_options={'date': ...} maps the date column like date_col."""
+    data = sample_data_fmb()
+    expected = estimate_fama_macbeth(
+        data, "ret_excess ~ beta + bm + log_mktcap"
+    )
+    result = estimate_fama_macbeth(
+        data.rename({"date": "month"}),
+        "ret_excess ~ beta + bm + log_mktcap",
+        data_options={"date": "month"},
+    )
+    assert result.equals(expected)
+
+
+def test_estimate_fama_macbeth_unrecognized_vcov_options_raises() -> None:
+    """Keys that sandwich::NeweyWest would reject raise instead of
+    being silently ignored."""
+    with pytest.raises(ValueError, match="Unrecognized vcov_options"):
+        estimate_fama_macbeth(
+            sample_data_fmb(),
+            "ret_excess ~ beta + bm + log_mktcap",
+            vcov_options={"kernel": "Bartlett"},
+        )
+
+
 def test_estimate_fama_macbeth_n_equals_number_of_periods() -> None:
     """The reported 'n' equals the number of distinct periods."""
     data = sample_data_fmb()
