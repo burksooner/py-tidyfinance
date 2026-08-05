@@ -329,6 +329,36 @@ def test_series_output_aligns_with_input_frame_index():
     assert result.index.equals(sub.index)
 
 
+def test_rolling_value_callback_receives_backend_frame():
+    """compute_rolling_value hands the window to the callback in the
+    active backend's frame type, so pandas-style callbacks (e.g.
+    '.iloc') keep working under the default backend."""
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime([f"2020-{m:02d}-01" for m in range(1, 7)]),
+            "value": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    out = tf.compute_rolling_value(
+        df,
+        f=lambda x: x["value"].iloc[-1],
+        period="month",
+        periods=2,
+        min_obs=1,
+    )
+    assert out[-1] == 6.0
+
+    tf.set_backend("polars")
+    out_pl = tf.compute_rolling_value(
+        pl.from_pandas(df),
+        f=lambda x: x["value"][-1],
+        period="month",
+        periods=2,
+        min_obs=1,
+    )
+    assert out_pl[-1] == 6.0
+
+
 def test_day_count_dateoffset_lags_by_days():
     """'pd.DateOffset(k)' without keyword components means k days in
     pandas; it must not collapse to a zero lag."""

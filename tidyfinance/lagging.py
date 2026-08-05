@@ -6,6 +6,7 @@ import numpy as np
 import polars as pl
 
 from ._internal import _check_new_col, _negate_offset, _offset_end, _to_offset
+from .backend import get_backend
 
 
 def add_lagged_columns(
@@ -486,9 +487,11 @@ def compute_rolling_value(
         'data_options[date]' (default 'date'). The column must be of
         dtype 'pl.Date' or 'pl.Datetime'.
     f : callable
-        Function applied to each window. Receives a 'pl.DataFrame'
-        slice (complete cases only) and must return a single scalar
-        value.
+        Function applied to each window. Receives the window slice
+        (complete cases only) as a data frame of the active backend
+        type ('pd.DataFrame' under the default 'pandas' backend,
+        'pl.DataFrame' under the 'polars' backend) and must return
+        a single scalar value.
     period : str, default 'month'
         Calendar period unit for the rolling windows. One of 'month',
         'quarter', or 'year'.
@@ -576,6 +579,11 @@ def compute_rolling_value(
     n = data.height
     result = np.full(n, np.nan)
 
+    # The user callback receives the window in the active backend's
+    # frame type, so pandas-style callbacks keep working under the
+    # default backend.
+    as_pandas = get_backend() == "pandas"
+
     for i in range(n):
         in_window = (buckets >= start_buckets[i]) & (buckets <= buckets[i])
         window_data = data.filter(in_window).drop_nulls()
@@ -584,7 +592,7 @@ def compute_rolling_value(
                 ~pl.any_horizontal([pl.col(c).is_nan() for c in float_cols])
             )
         if window_data.height >= min_obs:
-            value = f(window_data)
+            value = f(window_data.to_pandas() if as_pandas else window_data)
             result[i] = np.nan if value is None else value
 
     return result
