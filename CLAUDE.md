@@ -4,23 +4,39 @@ Guidance for working in this repository.
 
 ## Project layout
 
-- `tidyfinance/` — the package.
+- `tidyfinance/` — the package. **Internals are implemented in polars**:
+  module-level functions take and return `polars.DataFrame` objects, and
+  calendar-date columns are `polars.Date`. The public API additionally
+  accepts pandas input and returns pandas under the default backend (see
+  `backend.py`).
   - `__init__.py` — builds the public API automatically by scanning the
     public submodules and re-exporting their functions/classes (see
     `__all__`). Data-bearing functions are wrapped at this boundary by
-    `backend._use_backend` so they honor the active polars/pandas backend.
-    Keep this file's namespace clean: discovery loop variables, imports
-    (`importlib`, `pkgutil`, `types`), and internal toggles are deleted or
-    underscore-prefixed at the end so they don't leak into `dir(tidyfinance)`
-    or the docs.
-  - `core.py` — analytics functions (portfolio sorts, breakpoints, beta /
-    Fama-MacBeth estimation, lagging, summary statistics).
-  - `data_download.py` — `download_data` and the WRDS / Fama-French / FRED /
-    OSAP / Hugging Face download helpers.
-  - `backend.py` — `set_backend` / `get_backend` and the internal
-    `_use_backend` decorator.
+    `backend._use_backend` so they honor the active pandas/polars backend
+    (default `pandas`: pandas in → polars internals → pandas out; the
+    `polars` backend is a pass-through). Keep this file's namespace clean:
+    discovery loop variables, imports (`importlib`, `pkgutil`, `types`),
+    and internal toggles are deleted or underscore-prefixed at the end so
+    they don't leak into `dir(tidyfinance)` or the docs.
+  - `backend.py` — `set_backend` / `get_backend`, the `_use_backend`
+    decorator, and the `_DATE_COLUMNS` list of calendar-date columns.
+  - `lagging.py`, `portfolios.py`, `regression.py` — analytics functions
+    (lagged joins, portfolio sorts/breakpoints, beta / Fama-MacBeth
+    estimation).
+  - `download.py` — the `download_data` dispatcher;
+    `download_open_source.py`, `download_tidy_finance.py`,
+    `download_wrds.py`, `download_pseudo.py` — per-source download
+    helpers. SQL goes through `download_wrds._read_sql`
+    (`polars.read_database`); HTTP payloads are parsed with
+    `polars.read_csv` / `read_parquet` on fetched bytes.
   - `utilities.py`, `supported_datasets.py` — helpers and dataset metadata.
-  - `_internal.py`, `_pseudo.py` — private modules.
+  - `_internal.py` — private helpers (`_validate_dates` returns
+    `datetime.date`; `_to_offset` normalizes lags to polars offset strings
+    like `"1mo"`).
+- Missing values in frame outputs are polars nulls, not float `NaN`.
+- Do not import pandas inside modules; the only sanctioned touchpoints are
+  `backend.py` (boundary conversion) and `regression.py`'s
+  `formulaic.model_matrix(model, df.to_pandas())` call.
 
 ## Conventions
 

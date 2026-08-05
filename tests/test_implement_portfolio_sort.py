@@ -1,30 +1,41 @@
 """Tests for implement_portfolio_sort."""
 
+import datetime as dt
 import os
 import sys
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 )
 
-from tidyfinance.portfolios import breakpoint_options, data_options, filter_options, implement_portfolio_sort, portfolio_sort_options  # noqa: E402
+from tidyfinance.portfolios import (
+    breakpoint_options,
+    filter_options,
+    implement_portfolio_sort,
+    portfolio_sort_options,
+)  # noqa: E402
 
 
 def make_data(n_stocks=30, n_months=6, seed=42):
     """Construct a stock-month panel for tests."""
     rng = np.random.default_rng(seed)
-    dates = pd.date_range("2020-01-01", periods=n_months, freq="MS")
-    rows = [(p, d) for d in dates for p in range(1, n_stocks + 1)]
-    df = pd.DataFrame(rows, columns=["permno", "date"])
-    n = len(df)
-    df["ret_excess"] = rng.standard_normal(n)
-    df["size"] = rng.uniform(50, 150, n)
-    df["mktcap_lag"] = rng.uniform(100, 1000, n)
-    return df
+    dates = [dt.date(2020, i + 1, 1) for i in range(n_months)]
+    permnos = [p for _ in dates for p in range(1, n_stocks + 1)]
+    date_col = [d for d in dates for _ in range(n_stocks)]
+    n = len(permnos)
+    return pl.DataFrame(
+        {
+            "permno": permnos,
+            "date": date_col,
+            "ret_excess": rng.standard_normal(n),
+            "size": rng.uniform(50, 150, n),
+            "mktcap_lag": rng.uniform(100, 1000, n),
+        }
+    )
 
 
 _pso = portfolio_sort_options(
@@ -105,7 +116,7 @@ def test_delegates_to_filter_and_compute_on_valid_inputs():
         portfolio_sort_options=pso,
         quiet=True,
     )
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) > 0
     assert "portfolio" in result.columns
     assert "date" in result.columns

@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -521,17 +521,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/0f/d5/c66da9b79e5bdb124974bfe172b4daf3c984ebd9c2a06e2b8a4dc7331c72/defusedxml-0.7.1.tar.gz", hash = "sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69", size = 75520, upload-time = "2021-03-08T10:59:26.269Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl", hash = "sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61", size = 25604, upload-time = "2021-03-08T10:59:24.45Z" },
-]
-
-[[package]]
-name = "dotenv"
-version = "0.9.9"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "python-dotenv" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/b7/545d2c10c1fc15e48653c91efde329a790f2eecfbbf2bd16003b5db2bab0/dotenv-0.9.9-py2.py3-none-any.whl", hash = "sha256:29cf74a087b31dafdb5a446b6d7e11cbce8ed2741540e2339c69fbef92c94ce9", size = 1892, upload-time = "2025-02-19T22:15:01.647Z" },
 ]
 
 [[package]]
@@ -2750,25 +2739,27 @@ wheels = [
 
 [[package]]
 name = "tidyfinance"
-version = "0.3.1.dev4"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "curl-cffi" },
-    { name = "dotenv" },
     { name = "formulaic" },
-    { name = "lxml" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
+    { name = "polars" },
     { name = "psycopg2-binary" },
     { name = "pyarrow" },
-    { name = "requests" },
+    { name = "python-dotenv" },
     { name = "sqlalchemy" },
 ]
 
 [package.optional-dependencies]
 polars = [
     { name = "polars" },
+]
+scraping = [
+    { name = "lxml" },
 ]
 
 [package.dev-dependencies]
@@ -2785,18 +2776,18 @@ docs = [
 [package.metadata]
 requires-dist = [
     { name = "curl-cffi", specifier = ">=0.10.0" },
-    { name = "dotenv", specifier = ">=0.9.9" },
     { name = "formulaic", specifier = ">=1.0.0" },
-    { name = "lxml", specifier = ">=5.3.1" },
+    { name = "lxml", marker = "extra == 'scraping'", specifier = ">=5.3.1" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pandas", specifier = ">=2.2.0" },
+    { name = "polars", specifier = ">=1.0.0" },
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.0.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.9" },
     { name = "pyarrow", specifier = ">=19.0.1" },
-    { name = "requests", specifier = ">=2.32.4" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.21" },
 ]
-provides-extras = ["polars"]
+provides-extras = ["polars", "scraping"]
 
 [package.metadata.requires-dev]
 dev = [

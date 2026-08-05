@@ -8,11 +8,12 @@ for inference.
 
 from __future__ import annotations
 
+import datetime as dt
 import warnings
 from typing import Optional
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from ._internal import _validate_dates
 
@@ -69,7 +70,7 @@ _SUPPORTED_PSEUDO_DATASETS = (
 
 def _simulate_pseudo_identifiers(
     n_assets: int = 1000, seed: int = 1234
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Draw a pseudo universe of stock identifiers.
 
     Fully determined by '(seed, n_assets)' so calls to different
@@ -78,7 +79,7 @@ def _simulate_pseudo_identifiers(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         One row per pseudo firm with columns 'permno', 'permco',
         'gvkey', 'exchange', 'industry', and 'siccd'.
     """
@@ -97,10 +98,13 @@ def _simulate_pseudo_identifiers(
     exchange = rng.choice(exchanges, size=n_assets, p=exchange_probs)
     industry = rng.choice(industries, size=n_assets, p=industry_probs)
     siccd = np.array(
-        [rng.integers(_SIC_RANGES[ind][0], _SIC_RANGES[ind][1] + 1) for ind in industry]
+        [
+            rng.integers(_SIC_RANGES[ind][0], _SIC_RANGES[ind][1] + 1)
+            for ind in industry
+        ]
     )
 
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "permno": np.arange(1, n_assets + 1),
             "permco": np.arange(1, n_assets + 1),
@@ -143,7 +147,7 @@ def _simulate_pseudo_data(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     **kwargs,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Dispatch a pseudo-data request to the matching per-dataset generator.
 
@@ -173,7 +177,7 @@ def _simulate_pseudo_data(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Pseudo panel with the column layout of the corresponding WRDS
         dataset.
 
@@ -227,7 +231,7 @@ def _download_data_pseudo_crsp(
     batch_size: int = 500,
     n_assets: int = 1000,
     seed: int = 1234,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Generate pseudo CRSP data with the WRDS CRSP schema.
 
     Returns simulated panel data that mirrors the column layout of
@@ -275,7 +279,7 @@ def _download_data_pseudo_crsp(
 
     Returns
     -------
-    pandas.DataFrame
+    pl.DataFrame
         For 'crsp_monthly', a DataFrame with columns 'permno', 'date',
         'calculation_date', 'ret', 'shrout', 'prc', 'primaryexch',
         'siccd', 'listing_age', 'mktcap', 'mktcap_lag', 'exchange',
@@ -286,7 +290,7 @@ def _download_data_pseudo_crsp(
     Examples
     --------
     ```python
-    from tidyfinance._pseudo import _download_data_pseudo_crsp
+    from tidyfinance.download_pseudo import _download_data_pseudo_crsp
     monthly = _download_data_pseudo_crsp(
         'crsp_monthly',
         start_date='2020-01-01',
@@ -309,7 +313,9 @@ def _download_data_pseudo_crsp(
             "datasets: 'crsp_monthly', 'crsp_daily'."
         )
 
-    start_date, end_date = _validate_dates(start_date, end_date, use_default_range=True)
+    start_date, end_date = _validate_dates(
+        start_date, end_date, use_default_range=True
+    )
 
     identifiers = _simulate_pseudo_identifiers(n_assets=n_assets, seed=seed)
 
@@ -323,18 +329,23 @@ def _download_data_pseudo_crsp(
         )
 
     if add_ccm_links:
-        panel = panel.merge(identifiers[["permno", "gvkey"]], on="permno", how="left")
+        panel = panel.join(
+            identifiers.select("permno", "gvkey"),
+            on="permno",
+            how="left",
+            maintain_order="left",
+        )
 
     return panel
 
 
 def _simulate_pseudo_crsp_monthly(
-    identifiers: pd.DataFrame,
-    start_date,
-    end_date,
+    identifiers: pl.DataFrame,
+    start_date: dt.date,
+    end_date: dt.date,
     additional_columns,
     seed: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Generate a monthly CRSP pseudo panel.
 
@@ -347,11 +358,11 @@ def _simulate_pseudo_crsp_monthly(
 
     Parameters
     ----------
-    identifiers : pd.DataFrame
+    identifiers : pl.DataFrame
         Per-permno identifier frame with at least 'permno', 'exchange',
         'siccd', and 'industry' columns; produced by
         '_simulate_pseudo_identifiers'.
-    start_date, end_date : str or pd.Timestamp
+    start_date, end_date : datetime.date
         Inclusive sample range (the first month-start at or before
         'start_date' and the last month-start at or before 'end_date').
     additional_columns : list of str or None
@@ -363,48 +374,53 @@ def _simulate_pseudo_crsp_monthly(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Monthly panel with columns 'permno', 'date',
         'calculation_date', 'ret', 'shrout', 'prc', 'primaryexch',
         'siccd', 'listing_age', 'mktcap', 'mktcap_lag', 'exchange',
         'industry', 'ret_excess', followed by any requested
         'additional_columns'.
     """
-    start_m = pd.Timestamp(start_date).to_period("M").to_timestamp()
-    end_m = pd.Timestamp(end_date).to_period("M").to_timestamp()
-    months = pd.date_range(start_m, end_m, freq="MS")
+    months = pl.date_range(
+        start_date.replace(day=1),
+        end_date.replace(day=1),
+        interval="1mo",
+        eager=True,
+    ).alias("date")
 
     rng = np.random.default_rng(seed + 1)
 
-    panel = (
-        identifiers.merge(pd.DataFrame({"date": months}), how="cross")
-        .sort_values(["permno", "date"])
-        .reset_index(drop=True)
+    panel = identifiers.join(pl.DataFrame({"date": months}), how="cross").sort(
+        "permno", "date", maintain_order=True
     )
-    n = len(panel)
+    n = panel.height
 
-    panel = panel.assign(
-        calculation_date=panel["date"] + pd.offsets.MonthEnd(0),
-        shrout=rng.uniform(1, 50, size=n) * 1000,
-        prc=rng.uniform(1, 1000, size=n),
-        ret=rng.normal(0.008, 0.10, size=n),
+    shrout = rng.uniform(1, 50, size=n) * 1000
+    prc = rng.uniform(1, 1000, size=n)
+    ret = rng.normal(0.008, 0.10, size=n)
+
+    panel = panel.with_columns(
+        calculation_date=pl.col("date").dt.month_end(),
+        shrout=pl.Series(shrout),
+        prc=pl.Series(prc),
+        ret=pl.Series(ret),
+    ).with_columns(
+        mktcap=pl.Series(shrout * prc / 1000),
+        primaryexch=pl.col("exchange").replace_strict(
+            _PRIMARYEXCH_LOOKUP, default=None
+        ),
     )
-    panel = panel.assign(
-        mktcap=panel["shrout"] * panel["prc"] / 1000,
-        primaryexch=panel["exchange"].map(_PRIMARYEXCH_LOOKUP),
+    panel = panel.with_columns(
+        listing_age=pl.int_range(pl.len()).over("permno"),
+        mktcap_lag=pl.col("mktcap").shift(1).over("permno"),
     )
-    panel = panel.assign(
-        listing_age=panel.groupby("permno").cumcount(),
-        mktcap_lag=panel.groupby("permno")["mktcap"].shift(1),
-    )
-    panel = panel.assign(
-        ret_excess=np.maximum(panel["ret"] - rng.uniform(0, 0.004, size=n), -1)
-    )
+    ret_excess = np.maximum(ret - rng.uniform(0, 0.004, size=n), -1)
+    panel = panel.with_columns(ret_excess=pl.Series(ret_excess))
 
     additional_columns = additional_columns or []
     for col in additional_columns:
         if col not in panel.columns:
-            panel[col] = rng.normal(size=n)
+            panel = panel.with_columns(pl.Series(col, rng.normal(size=n)))
 
     base_cols = [
         "permno",
@@ -423,16 +439,16 @@ def _simulate_pseudo_crsp_monthly(
         "ret_excess",
     ]
     extra_cols = [c for c in additional_columns if c not in base_cols]
-    return panel[base_cols + extra_cols]
+    return panel.select(base_cols + extra_cols)
 
 
 def _simulate_pseudo_crsp_daily(
-    identifiers: pd.DataFrame,
-    start_date,
-    end_date,
+    identifiers: pl.DataFrame,
+    start_date: dt.date,
+    end_date: dt.date,
     additional_columns,
     seed: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Generate a daily CRSP pseudo panel restricted to weekdays.
 
@@ -443,9 +459,9 @@ def _simulate_pseudo_crsp_daily(
 
     Parameters
     ----------
-    identifiers : pd.DataFrame
+    identifiers : pl.DataFrame
         Identifier frame; only the 'permno' column is used.
-    start_date, end_date : str or pd.Timestamp
+    start_date, end_date : datetime.date
         Inclusive date range. Weekend days are dropped before the
         cross-join.
     additional_columns : list of str or None
@@ -456,38 +472,37 @@ def _simulate_pseudo_crsp_daily(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Daily panel with columns 'permno', 'date', 'ret',
         'ret_excess', followed by any requested 'additional_columns'.
     """
-    all_days = pd.date_range(start_date, end_date, freq="D")
-    weekdays = all_days[all_days.weekday < 5]
+    all_days = pl.date_range(
+        start_date, end_date, interval="1d", eager=True
+    ).alias("date")
+    weekdays = all_days.filter(all_days.dt.weekday() <= 5)
 
     rng = np.random.default_rng(seed + 2)
 
     panel = (
-        identifiers[["permno"]]
-        .merge(pd.DataFrame({"date": weekdays}), how="cross")
-        .sort_values(["permno", "date"])
-        .reset_index(drop=True)
+        identifiers.select("permno")
+        .join(pl.DataFrame({"date": weekdays}), how="cross")
+        .sort("permno", "date", maintain_order=True)
     )
-    n = len(panel)
+    n = panel.height
 
-    panel = panel.assign(
-        ret=rng.normal(0.0004, 0.02, size=n),
-    )
-    panel = panel.assign(
-        ret_excess=np.maximum(panel["ret"] - rng.uniform(0, 0.0002, size=n), -1)
-    )
+    ret = rng.normal(0.0004, 0.02, size=n)
+    panel = panel.with_columns(ret=pl.Series(ret))
+    ret_excess = np.maximum(ret - rng.uniform(0, 0.0002, size=n), -1)
+    panel = panel.with_columns(ret_excess=pl.Series(ret_excess))
 
     additional_columns = additional_columns or []
     for col in additional_columns:
         if col not in panel.columns:
-            panel[col] = rng.normal(size=n)
+            panel = panel.with_columns(pl.Series(col, rng.normal(size=n)))
 
     base_cols = ["permno", "date", "ret", "ret_excess"]
     extra_cols = [c for c in additional_columns if c not in base_cols]
-    return panel[base_cols + extra_cols]
+    return panel.select(base_cols + extra_cols)
 
 
 # %% Pseudo Compustat
@@ -501,7 +516,7 @@ def _download_data_pseudo_compustat(
     only_usd: bool = False,
     n_assets: int = 1000,
     seed: int = 1234,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Generate pseudo Compustat data with the WRDS schema.
 
     Returns simulated panel data that mirrors the column layout of
@@ -540,7 +555,7 @@ def _download_data_pseudo_compustat(
 
     Returns
     -------
-    pandas.DataFrame
+    pl.DataFrame
         For 'compustat_annual', a DataFrame with 'gvkey', 'date',
         'datadate', the financial-statement variables 'seq', 'ceq',
         'at', 'lt', 'txditc', 'txdb', 'itcb', 'pstkrv', 'pstkl',
@@ -553,7 +568,9 @@ def _download_data_pseudo_compustat(
     Examples
     --------
     ```python
-    from tidyfinance._pseudo import _download_data_pseudo_compustat
+    from tidyfinance.download_pseudo import (
+        _download_data_pseudo_compustat,
+    )
     annual = _download_data_pseudo_compustat(
         'compustat_annual',
         start_date='2020-01-01',
@@ -578,7 +595,9 @@ def _download_data_pseudo_compustat(
             "'compustat_quarterly'."
         )
 
-    start_date, end_date = _validate_dates(start_date, end_date, use_default_range=True)
+    start_date, end_date = _validate_dates(
+        start_date, end_date, use_default_range=True
+    )
 
     identifiers = _simulate_pseudo_identifiers(n_assets=n_assets, seed=seed)
 
@@ -592,12 +611,12 @@ def _download_data_pseudo_compustat(
 
 
 def _simulate_pseudo_compustat_annual(
-    identifiers: pd.DataFrame,
-    start_date,
-    end_date,
+    identifiers: pl.DataFrame,
+    start_date: dt.date,
+    end_date: dt.date,
     additional_columns,
     seed: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Generate an annual Compustat pseudo panel.
 
@@ -611,9 +630,9 @@ def _simulate_pseudo_compustat_annual(
 
     Parameters
     ----------
-    identifiers : pd.DataFrame
+    identifiers : pl.DataFrame
         Identifier frame; only the 'gvkey' column is used.
-    start_date, end_date : str or pd.Timestamp
+    start_date, end_date : datetime.date
         Inclusive date range. The year component drives the panel;
         sub-annual resolution is ignored.
     additional_columns : list of str or None
@@ -624,112 +643,114 @@ def _simulate_pseudo_compustat_annual(
 
     Returns
     -------
-    pd.DataFrame
-        Annual panel with 'gvkey', 'year', 'datadate' (Dec 31 of
-        each year), 'date' (month-start of December), and the
-        Compustat-style accounting columns, followed by any requested
+    pl.DataFrame
+        Annual panel with 'gvkey', 'datadate' (Dec 31 of each year),
+        'date' (month-start of December), and the Compustat-style
+        accounting columns, followed by any requested
         'additional_columns'.
     """
-    years = np.arange(pd.Timestamp(start_date).year, pd.Timestamp(end_date).year + 1)
+    years = np.arange(start_date.year, end_date.year + 1)
     rng = np.random.default_rng(seed + 4)
 
     panel = (
-        identifiers[["gvkey"]]
-        .merge(pd.DataFrame({"year": years}), how="cross")
-        .sort_values(["gvkey", "year"])
-        .reset_index(drop=True)
+        identifiers.select("gvkey")
+        .join(pl.DataFrame({"year": years}), how="cross")
+        .sort("gvkey", "year", maintain_order=True)
     )
-    n = len(panel)
+    n = panel.height
 
-    # AR-1-like cumulative growth per gvkey -> at
-    panel["growth"] = rng.normal(0.05, 0.30, size=n)
-    panel["at"] = panel.groupby("gvkey")["growth"].transform(
-        lambda x: 100 * np.exp(np.cumsum(x))
-    )
-    panel = panel.drop(columns="growth")
+    # AR-1-like cumulative growth per gvkey -> at. The panel is sorted
+    # by gvkey with one contiguous, equally sized block of years per
+    # gvkey, so the groupwise cumulative sum is a row-wise cumsum on
+    # the reshaped draw matrix (bit-identical to the per-group numpy
+    # computation of the pandas reference implementation).
+    growth = rng.normal(0.05, 0.30, size=n)
+    at = 100 * np.exp(growth.reshape(-1, years.size).cumsum(axis=1)).ravel()
+    panel = panel.with_columns(at=pl.Series(at))
 
-    datadate = pd.to_datetime(panel["year"].astype(str) + "-12-31")
-    panel = panel.assign(
-        datadate=datadate,
-        date=datadate.dt.to_period("M").dt.to_timestamp(),
-        seq=panel["at"] * rng.uniform(0.3, 0.7, size=n),
+    panel = panel.with_columns(
+        datadate=pl.date(pl.col("year"), 12, 31),
+        date=pl.date(pl.col("year"), 12, 1),
+        seq=pl.col("at") * pl.Series(rng.uniform(0.3, 0.7, size=n)),
     )
-    panel = panel.assign(
-        ceq=panel["seq"] * rng.uniform(0.8, 1.0, size=n),
-        lt=panel["at"] - panel["seq"],
-        txditc=panel["at"] * rng.uniform(0.0, 0.05, size=n),
+    panel = panel.with_columns(
+        ceq=pl.col("seq") * pl.Series(rng.uniform(0.8, 1.0, size=n)),
+        lt=pl.col("at") - pl.col("seq"),
+        txditc=pl.col("at") * pl.Series(rng.uniform(0.0, 0.05, size=n)),
     )
-    panel = panel.assign(
-        txdb=panel["txditc"] * rng.uniform(0.0, 1.0, size=n),
+    panel = panel.with_columns(
+        txdb=pl.col("txditc") * pl.Series(rng.uniform(0.0, 1.0, size=n)),
     )
-    panel = panel.assign(
-        itcb=panel["txditc"] - panel["txdb"],
-        pstkrv=panel["at"] * rng.uniform(0.0, 0.02, size=n),
+    panel = panel.with_columns(
+        itcb=pl.col("txditc") - pl.col("txdb"),
+        pstkrv=pl.col("at") * pl.Series(rng.uniform(0.0, 0.02, size=n)),
     )
-    panel = panel.assign(
-        pstkl=panel["pstkrv"],
-        pstk=panel["pstkrv"],
-        capx=panel["at"] * rng.uniform(0.02, 0.10, size=n),
-        oancf=panel["at"] * rng.normal(0.07, 0.05, size=n),
-        sale=panel["at"] * rng.uniform(0.5, 1.5, size=n),
+    panel = panel.with_columns(
+        pstkl=pl.col("pstkrv"),
+        pstk=pl.col("pstkrv"),
+        capx=pl.col("at") * pl.Series(rng.uniform(0.02, 0.10, size=n)),
+        oancf=pl.col("at") * pl.Series(rng.normal(0.07, 0.05, size=n)),
+        sale=pl.col("at") * pl.Series(rng.uniform(0.5, 1.5, size=n)),
     )
-    panel = panel.assign(
-        cogs=panel["sale"] * rng.uniform(0.5, 0.8, size=n),
-        xsga=panel["sale"] * rng.uniform(0.05, 0.20, size=n),
-        xint=panel["at"] * rng.uniform(0.005, 0.03, size=n),
-        ib=panel["at"] * rng.normal(0.05, 0.10, size=n),
-        curcd="USD",
+    panel = panel.with_columns(
+        cogs=pl.col("sale") * pl.Series(rng.uniform(0.5, 0.8, size=n)),
+        xsga=pl.col("sale") * pl.Series(rng.uniform(0.05, 0.20, size=n)),
+        xint=pl.col("at") * pl.Series(rng.uniform(0.005, 0.03, size=n)),
+        ib=pl.col("at") * pl.Series(rng.normal(0.05, 0.10, size=n)),
+        curcd=pl.lit("USD"),
     )
 
     additional_columns = additional_columns or []
     for col in additional_columns:
         if col not in panel.columns:
-            panel[col] = rng.normal(size=n)
+            panel = panel.with_columns(pl.Series(col, rng.normal(size=n)))
 
-    panel = panel.assign(
+    panel = panel.with_columns(
         be=(
-            panel["seq"]
-            .combine_first(panel["ceq"] + panel["pstk"])
-            .combine_first(panel["at"] - panel["lt"])
-            + panel["txditc"].combine_first(panel["txdb"] + panel["itcb"]).fillna(0)
-            - panel["pstkrv"]
-            .combine_first(panel["pstkl"])
-            .combine_first(panel["pstk"])
-            .fillna(0)
+            pl.coalesce(
+                pl.col("seq"),
+                pl.col("ceq") + pl.col("pstk"),
+                pl.col("at") - pl.col("lt"),
+            )
+            + pl.coalesce(
+                pl.col("txditc"), pl.col("txdb") + pl.col("itcb")
+            ).fill_null(0)
+            - pl.coalesce(
+                pl.col("pstkrv"), pl.col("pstkl"), pl.col("pstk")
+            ).fill_null(0)
         ),
     )
-    panel = panel.assign(
+    panel = panel.with_columns(
         op=(
-            panel["sale"]
-            - panel["cogs"].fillna(0)
-            - panel["xsga"].fillna(0)
-            - panel["xint"].fillna(0)
+            pl.col("sale")
+            - pl.col("cogs").fill_null(0)
+            - pl.col("xsga").fill_null(0)
+            - pl.col("xint").fill_null(0)
         )
-        / panel["be"]
+        / pl.col("be")
     )
 
-    lag = (
-        panel[["gvkey", "year", "at"]]
-        .rename(columns={"at": "at_lag"})
-        .assign(year=lambda df: df["year"] + 1)
+    panel = panel.with_columns(
+        at_lag=pl.col("at").shift(1).over("gvkey"),
     )
-    panel = panel.merge(lag, on=["gvkey", "year"], how="left")
-    panel = panel.assign(
-        inv=np.where(panel["at_lag"] <= 0, np.nan, panel["at"] / panel["at_lag"] - 1)
+    panel = panel.with_columns(
+        inv=pl.when(pl.col("at_lag") <= 0)
+        .then(None)
+        .otherwise(pl.col("at") / pl.col("at_lag") - 1)
     )
 
     first_cols = ["gvkey", "date", "datadate"]
     other_cols = [c for c in panel.columns if c not in first_cols + ["year"]]
-    return panel[first_cols + other_cols]
+    return panel.select(first_cols + other_cols)
 
 
 def _simulate_pseudo_compustat_quarterly(
-    identifiers: pd.DataFrame,
-    start_date,
-    end_date,
+    identifiers: pl.DataFrame,
+    start_date: dt.date,
+    end_date: dt.date,
     additional_columns,
     seed: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Generate a quarterly Compustat pseudo panel.
 
@@ -741,9 +762,9 @@ def _simulate_pseudo_compustat_quarterly(
 
     Parameters
     ----------
-    identifiers : pd.DataFrame
+    identifiers : pl.DataFrame
         Identifier frame; only the 'gvkey' column is used.
-    start_date, end_date : str or pd.Timestamp
+    start_date, end_date : datetime.date
         Inclusive date range, rounded to quarter starts and ends.
     additional_columns : list of str or None
         Extra column names to attach. Each is filled with i.i.d.
@@ -753,45 +774,47 @@ def _simulate_pseudo_compustat_quarterly(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Quarterly panel with 'gvkey', 'datadate' (quarter-end),
         'date' (month-start), 'atq', 'ceqq', followed by any
         requested 'additional_columns'.
     """
-    start_q = pd.Timestamp(start_date).to_period("Q").to_timestamp()
-    end_q = pd.Timestamp(end_date).to_period("Q").to_timestamp()
-    q_starts = pd.date_range(start_q, end_q, freq="QS")
-    q_ends = q_starts + pd.offsets.QuarterEnd(0)
+    start_q = start_date.replace(
+        month=3 * ((start_date.month - 1) // 3) + 1, day=1
+    )
+    end_q = end_date.replace(month=3 * ((end_date.month - 1) // 3) + 1, day=1)
+    q_starts = pl.date_range(start_q, end_q, interval="3mo", eager=True)
+    q_ends = q_starts.dt.offset_by("2mo").dt.month_end().alias("datadate")
 
     rng = np.random.default_rng(seed + 3)
 
     panel = (
-        identifiers[["gvkey"]]
-        .merge(pd.DataFrame({"datadate": q_ends}), how="cross")
-        .sort_values(["gvkey", "datadate"])
-        .reset_index(drop=True)
+        identifiers.select("gvkey")
+        .join(pl.DataFrame({"datadate": q_ends}), how="cross")
+        .sort("gvkey", "datadate", maintain_order=True)
     )
-    n = len(panel)
+    n = panel.height
 
-    panel["growth"] = rng.normal(0.012, 0.15, size=n)
-    panel["atq"] = panel.groupby("gvkey")["growth"].transform(
-        lambda x: 100 * np.exp(np.cumsum(x))
-    )
-    panel = panel.drop(columns="growth")
+    # Same contiguous-block trick as in the annual generator: the
+    # groupwise cumulative growth is a row-wise cumsum on the reshaped
+    # draw matrix.
+    growth = rng.normal(0.012, 0.15, size=n)
+    atq = 100 * np.exp(growth.reshape(-1, q_ends.len()).cumsum(axis=1)).ravel()
+    panel = panel.with_columns(atq=pl.Series(atq))
 
-    panel = panel.assign(
-        date=panel["datadate"].dt.to_period("M").dt.to_timestamp(),
-        ceqq=panel["atq"] * rng.uniform(0.2, 0.6, size=n),
+    panel = panel.with_columns(
+        date=pl.col("datadate").dt.truncate("1mo"),
+        ceqq=pl.col("atq") * pl.Series(rng.uniform(0.2, 0.6, size=n)),
     )
 
     additional_columns = additional_columns or []
     for col in additional_columns:
         if col not in panel.columns:
-            panel[col] = rng.normal(size=n)
+            panel = panel.with_columns(pl.Series(col, rng.normal(size=n)))
 
     base_cols = ["gvkey", "date", "datadate", "atq", "ceqq"]
     extra_cols = [c for c in additional_columns if c not in base_cols]
-    return panel[base_cols + extra_cols]
+    return panel.select(base_cols + extra_cols)
 
 
 # %% Pseudo CCM links
@@ -802,7 +825,7 @@ def _download_data_pseudo_ccm_links(
     seed: int = 1234,
     linktype: Optional[list] = None,
     linkprim: Optional[list] = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Generate a pseudo CRSP-Compustat linking table.
 
     Returns a simulated linking table with the same column layout as
@@ -826,20 +849,24 @@ def _download_data_pseudo_ccm_links(
 
     Returns
     -------
-    pandas.DataFrame
+    pl.DataFrame
         DataFrame with columns 'permno', 'gvkey', 'linkdt', and
         'linkenddt', one row per pseudo firm.
 
     Examples
     --------
     ```python
-    from tidyfinance._pseudo import _download_data_pseudo_ccm_links
+    from tidyfinance.download_pseudo import (
+        _download_data_pseudo_ccm_links,
+    )
     links = _download_data_pseudo_ccm_links(n_assets=10)
     ```
     """
     _ = (linktype, linkprim)
     identifiers = _simulate_pseudo_identifiers(n_assets=n_assets, seed=seed)
-    return identifiers[["permno", "gvkey"]].assign(
-        linkdt=pd.Timestamp("1925-12-31"),
-        linkenddt=pd.Timestamp("2099-12-31"),
-    )[["permno", "gvkey", "linkdt", "linkenddt"]]
+    return identifiers.select(
+        "permno",
+        "gvkey",
+        linkdt=pl.lit(dt.date(1925, 12, 31)),
+        linkenddt=pl.lit(dt.date(2099, 12, 31)),
+    )

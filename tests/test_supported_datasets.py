@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import pandas as pd
+import polars as pl
 import pytest
 
 from tidyfinance.supported_datasets import (
@@ -73,9 +73,9 @@ def test_other_table_has_expected_columns():
 
 def test_default_call_returns_dataframe_with_all_domains():
     result = list_supported_datasets()
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert list(result.columns) == ["type", "dataset_name", "domain"]
-    present = set(result["domain"].unique())
+    present = set(result["domain"].unique().to_list())
     assert {"Fama-French", "Global Q", "WRDS"}.issubset(present)
 
 
@@ -98,14 +98,14 @@ def test_domain_filter_returns_only_matching_rows():
 
 def test_domain_filter_accepts_list():
     result = list_supported_datasets(domain=["WRDS", "Global Q"])
-    assert set(result["domain"].unique()) == {"WRDS", "Global Q"}
+    assert set(result["domain"].unique().to_list()) == {"WRDS", "Global Q"}
 
 
 def test_as_vector_returns_list_of_types():
     result = list_supported_datasets(as_vector=True)
     assert isinstance(result, list)
     assert all(isinstance(t, str) for t in result)
-    assert not isinstance(result, pd.DataFrame)
+    assert not isinstance(result, pl.DataFrame)
 
 
 def test_total_row_count_matches_sum_of_components():

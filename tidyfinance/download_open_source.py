@@ -1,5 +1,7 @@
 """Open-source data downloads for tidyfinance."""
 
+import calendar
+import datetime as dt
 import io
 import re
 import time
@@ -7,11 +9,12 @@ import warnings
 import zipfile
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from curl_cffi import requests
 
 from ._internal import (
     _get_random_user_agent,
+    _parse_date,
     _transfrom_to_snake_case,
     _validate_dates,
 )
@@ -26,6 +29,71 @@ from .supported_datasets import (
 from .utilities import list_supported_indexes
 
 # %% functions
+
+
+def _fetch_csv(url: str, timeout: int = 60, **read_csv_kwargs) -> pl.DataFrame:
+    """Fetch a CSV file over HTTP and parse it with polars.
+
+    Parameters
+    ----------
+    url : str
+        The URL of the CSV file.
+    timeout : int, default 60
+        Request timeout in seconds.
+    **read_csv_kwargs
+        Additional keyword arguments forwarded to 'polars.read_csv'.
+
+    Returns
+    -------
+    pl.DataFrame
+        The parsed CSV file.
+    """
+    headers = {"User-Agent": _get_random_user_agent()}
+    response = requests.get(
+        url, headers=headers, impersonate="chrome120", timeout=timeout
+    )
+    response.raise_for_status()
+    return pl.read_csv(io.BytesIO(response.content), **read_csv_kwargs)
+
+
+def _fetch_whitespace_table(
+    url: str, names: list, timeout: int = 60
+) -> pl.DataFrame:
+    """Fetch a whitespace-delimited text file and parse it with polars.
+
+    Lines starting with a percent sign are treated as comments and
+    dropped; runs of whitespace within the remaining lines act as the
+    field separator.
+
+    Parameters
+    ----------
+    url : str
+        The URL of the text file.
+    names : list of str
+        Column names assigned to the parsed fields.
+    timeout : int, default 60
+        Request timeout in seconds.
+
+    Returns
+    -------
+    pl.DataFrame
+        The parsed table with columns 'names'.
+    """
+    headers = {"User-Agent": _get_random_user_agent()}
+    response = requests.get(
+        url, headers=headers, impersonate="chrome120", timeout=timeout
+    )
+    response.raise_for_status()
+    lines = [
+        re.sub(r"\s+", ",", line.strip())
+        for line in response.text.splitlines()
+        if line.strip() and not line.lstrip().startswith("%")
+    ]
+    return pl.read_csv(
+        io.BytesIO("\n".join(lines).encode("utf-8")),
+        has_header=False,
+        new_columns=names,
+    )
 
 
 def get_available_famafrench_datasets():
@@ -44,8 +112,9 @@ def get_available_famafrench_datasets():
         from lxml.html import document_fromstring
     except Exception:
         raise ImportError(
-            "Please install lxml if you want to use the "
-            "get_datasets_famafrench function"
+            "get_available_famafrench_datasets requires the optional "
+            "'lxml' package. Install it via "
+            "'pip install tidyfinance[scraping]' or 'pip install lxml'."
         )
 
     response = requests.get(f"{ff_url}data_library.html")
@@ -82,13 +151,13 @@ def _famafrench_downloader(file_url, start_date=None, end_date=None):
 
     Returns
     -------
-    pd.DataFrame
-        The first parsed table in the archive, indexed by date. Factor
-        files return columns such as 'Mkt-RF', 'SMB', 'HML', 'RF';
-        breakpoint files return one column per percentile bin plus
-        diagnostic columns ('<=0', '>0', 'Count') depending on the
-        file. Returns 'None' implicitly if no table could be parsed.
-        The Fama-French archives often contain several tables
+    pl.DataFrame
+        The first parsed table in the archive, with a leading 'date'
+        column. Factor files return columns such as 'Mkt-RF', 'SMB',
+        'HML', 'RF'; breakpoint files return one column per percentile
+        bin plus diagnostic columns ('<=0', '>0', 'Count') depending
+        on the file. Returns 'None' implicitly if no table could be
+        parsed. The Fama-French archives often contain several tables
         (value-weighted, equal-weighted, etc.); only the first is
         returned. Download the source ZIP directly if you need the
         others.
@@ -112,15 +181,21 @@ def _famafrench_downloader(file_url, start_date=None, end_date=None):
         stem = stem[: -len("_CSV.zip")]
 
     # Breakpoint dataset cases
-    params = {"index_col": 0}
+    read_kwargs = {}
     if stem.endswith("_Breakpoints"):
         if "-" in stem:
             cols = ["<=0", ">0"]
         else:
             cols = ["Count"]
         r = list(range(0, 105, 5))
-        params["names"] = ["Date"] + cols + list(zip(r, r[1:]))
-        params["skiprows"] = 1 if stem != "Prior_2-12_Breakpoints" else 3
+        read_kwargs["new_columns"] = (
+            ["Date"] + cols + [f"{lo}-{hi}" for lo, hi in zip(r, r[1:])]
+        )
+        read_kwargs["has_header"] = False
+        read_kwargs["skip_rows"] = 1 if stem != "Prior_2-12_Breakpoints" else 3
+
+    start = _parse_date(start_date) if start_date else None
+    end = _parse_date(end_date) if end_date else None
 
     doc_chunks, tables = [], []
     for chunk in data_raw.split(2 * "\r\n"):
@@ -129,48 +204,61 @@ def _famafrench_downloader(file_url, start_date=None, end_date=None):
         else:
             tables.append(chunk)
 
-    for i, src in enumerate(tables):
+    for src in tables:
         match = re.search(r"^\s*,", src, re.M)  # the table starts there
-        start = 0 if not match else match.start()
+        table_start = 0 if not match else match.start()
 
         # raw to dataframe
         try:
-            df = pd.read_csv(io.StringIO("Date" + src[start:]), **params)
-        except pd.errors.ParserError as e:
+            df = pl.read_csv(
+                ("Date" + src[table_start:]).encode("utf-8"), **read_kwargs
+            )
+        except Exception as e:
             warnings.warn(str(e), UserWarning, stacklevel=2)
             continue
 
-        # get index as datetime
-        try:
-            idx_name = df.index.name
+        # Space-padded numeric fields are read as strings by polars;
+        # strip and cast them so values match the pandas parser.
+        idx_name = df.columns[0]
+        df = df.with_columns(
+            [
+                pl.col(c).str.strip_chars().cast(pl.Float64, strict=False)
+                for c, dtype in df.schema.items()
+                if dtype == pl.String and c != idx_name
+            ]
+        )
 
-            s = df.index.astype(str)
-            if (s.str.len() == 8).all():
-                fmt, add, freq = "%Y%m%d", "", "D"
-                s_dt = [f"{i}{add}" for i in s]
-                dt = pd.to_datetime(s_dt, format=fmt, errors="coerce")
-            elif (s.str.len() == 6).all():
-                fmt, add, freq = "%Y%m%d", "01", "M"
-                s_dt = [f"{i}01" for i in s]
-                dt = pd.to_datetime(s_dt, format="%Y%m%d", errors="coerce")
-            elif (s.str.len() == 4).all():
-                fmt, add, freq = "%Y%m%d", "0101", "A-DEC"
-                s_dt = [f"{i}0101" for i in s]
-                dt = pd.to_datetime(s_dt, format="%Y%m%d", errors="coerce")
-                dt = dt.to_period(freq).to_timestamp(how="end")
+        # get the leading integer-date column as a proper date
+        try:
+            s = df.get_column(idx_name).cast(pl.String).str.strip_chars()
+            lengths = s.str.len_chars()
+            if (lengths == 8).all():
+                dates = s.str.to_date("%Y%m%d", strict=False)
+            elif (lengths == 6).all():
+                dates = (s + "01").str.to_date("%Y%m%d", strict=False)
+            elif (lengths == 4).all():
+                # annual data is aligned to the year end
+                dates = (s + "1231").str.to_date("%Y%m%d", strict=False)
             else:
                 raise ValueError("Unrecognized integer date format in index.")
-            df = df[~dt.isna()].copy()
-            df.index = dt[~dt.isna()]
-            df.index.name = idx_name.strip().lower()
+            new_name = idx_name.strip().lower()
+            df = (
+                df.with_columns(dates.alias("__ff_date"))
+                .filter(pl.col("__ff_date").is_not_null())
+                .drop(idx_name)
+                .rename({"__ff_date": new_name})
+            )
+            df = df.select(
+                [new_name] + [c for c in df.columns if c != new_name]
+            )
         except Exception:
             pass
 
         # start and end dates
-        if start_date:
-            df = df[df.index >= pd.to_datetime(start_date)]
-        if end_date:
-            df = df[df.index <= pd.to_datetime(end_date)]
+        if start:
+            df = df.filter(pl.col("date") >= start)
+        if end:
+            df = df.filter(pl.col("date") <= end)
         return df
 
 
@@ -179,7 +267,7 @@ def _download_data_factors_ff(
     start_date: str = None,
     end_date: str = None,
     type: str = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process Fama-French factor data.
 
@@ -215,7 +303,7 @@ def _download_data_factors_ff(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with processed factor data, including the date,
         risk-free rate, market excess return, and other factors,
         filtered by the specified date range.
@@ -278,43 +366,45 @@ def _download_data_factors_ff(
         )
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            raw_downloaded = _famafrench_downloader(
-                file_url, start_date=start_date, end_date=end_date
+        raw_downloaded = _famafrench_downloader(
+            file_url, start_date=start_date, end_date=end_date
+        )
+        value_cols = raw_downloaded.columns[1:]
+        if not _is_breakpoints_ff(dataset):
+            raw_downloaded = raw_downloaded.with_columns(
+                [pl.col(c) / 100 for c in value_cols]
             )
-            if not _is_breakpoints_ff(dataset):
-                raw_downloaded = raw_downloaded.div(100)
-            raw_data = (
-                raw_downloaded.reset_index()
-                .rename(
-                    columns=lambda x: (
-                        x.lower()
-                        .replace("-rf", "_excess")
-                        .replace("rf", "risk_free")
-                        if isinstance(x, str)
-                        else x
-                    )
+        raw_data = raw_downloaded.rename(
+            {
+                c: (
+                    c.lower()
+                    .replace("-rf", "_excess")
+                    .replace("rf", "risk_free")
                 )
-                .apply(
-                    lambda x: (
-                        x.replace([-99.99, -999], np.nan)
-                        if x.name != "date"
-                        else x
-                    )
-                )
-            )
-            raw_data = raw_data[
-                ["date"] + [col for col in raw_data.columns if col != "date"]
-            ].reset_index(drop=True)
-            return raw_data
+                for c in raw_downloaded.columns
+            }
+        )
+        raw_data = raw_data.with_columns(
+            [
+                pl.when((pl.col(c) == -99.99) | (pl.col(c) == -999))
+                .then(None)
+                .otherwise(pl.col(c))
+                .alias(c)
+                for c in raw_data.columns
+                if c != "date" and raw_data.schema[c].is_numeric()
+            ]
+        )
+        raw_data = raw_data.select(
+            ["date"] + [col for col in raw_data.columns if col != "date"]
+        )
+        return raw_data
     except Exception as e:
         warnings.warn(
             f"Returning an empty dataset due to download failure: {e}",
             UserWarning,
             stacklevel=2,
         )
-        return pd.DataFrame()
+        return pl.DataFrame()
 
 
 def _download_data_factors_q(
@@ -323,7 +413,7 @@ def _download_data_factors_q(
     end_date: str = None,
     type: str = None,
     url: str = "https://global-q.org/uploads/1/2/2/6/122679606/",
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process Global Q factor data.
 
@@ -360,7 +450,7 @@ def _download_data_factors_q(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with processed factor data, including the date,
         risk-free rate, market excess return, and other factors,
         filtered by the specified date range.
@@ -415,49 +505,56 @@ def _download_data_factors_q(
             " must include the year, e.g. 'q5_factors_daily_2024'."
         )
     try:
-        raw_data = (
-            pd.read_csv(
-                f"{url}{dataset}.csv", engine="python", on_bad_lines="skip"
-            )
-            .rename(columns=lambda x: x.lower().replace("r_", ""))
-            .rename(columns={"f": "risk_free", "mkt": "mkt_excess"})
+        raw_data = _fetch_csv(
+            f"{url}{dataset}.csv", truncate_ragged_lines=True
         )
+        raw_data = raw_data.rename(
+            {c: c.lower().replace("r_", "") for c in raw_data.columns}
+        ).rename({"f": "risk_free", "mkt": "mkt_excess"}, strict=False)
     except Exception as e:
         raise ValueError(
             f"Could not download or parse dataset '{dataset}': {e}"
         ) from e
 
     if "monthly" in dataset:
-        raw_data = raw_data.assign(
-            date=pd.to_datetime(
-                dict(year=raw_data.year, month=raw_data.month, day=1)
-            )
-        ).drop(columns=["year", "month"])
+        raw_data = raw_data.with_columns(
+            pl.date(pl.col("year"), pl.col("month"), 1).alias("date")
+        ).drop(["year", "month"])
     if "weekly" in dataset:
-        raw_data = raw_data.assign(
-            date=pd.to_datetime(
-                dict(
-                    year=raw_data.year,
-                    month=raw_data.month,
-                    day=raw_data.day,
-                )
-            )
-        ).drop(columns=["year", "month", "day"])
+        raw_data = raw_data.with_columns(
+            pl.date(
+                pl.col("year"), pl.col("month"), pl.col("day")
+            ).alias("date")
+        ).drop(["year", "month", "day"])
     if "annual" in dataset:
-        raw_data = raw_data.assign(
-            date=lambda x: pd.to_datetime(x["year"].astype(str) + "-01-01")
-        ).drop(columns=["year"])
+        raw_data = raw_data.with_columns(
+            pl.date(pl.col("year"), 1, 1).alias("date")
+        ).drop("year")
 
-    raw_data = raw_data.assign(date=lambda x: pd.to_datetime(x["date"])).apply(
-        lambda x: x.div(100) if x.name != "date" else x
+    date_dtype = raw_data.schema["date"]
+    if date_dtype == pl.String:
+        raw_data = raw_data.with_columns(
+            pl.col("date").str.replace_all("-", "").str.to_date("%Y%m%d")
+        )
+    elif date_dtype.is_integer():
+        raw_data = raw_data.with_columns(
+            pl.col("date").cast(pl.String).str.to_date("%Y%m%d")
+        )
+    elif date_dtype != pl.Date:
+        raw_data = raw_data.with_columns(pl.col("date").cast(pl.Date))
+
+    raw_data = raw_data.with_columns(
+        [pl.col(c) / 100 for c in raw_data.columns if c != "date"]
     )
 
     if start_date and end_date:
-        raw_data = raw_data.query("@start_date <= date <= @end_date")
+        raw_data = raw_data.filter(
+            pl.col("date").is_between(start_date, end_date)
+        )
 
-    raw_data = raw_data[
+    raw_data = raw_data.select(
         ["date"] + [col for col in raw_data.columns if col != "date"]
-    ].reset_index(drop=True)
+    )
     return raw_data
 
 
@@ -467,7 +564,7 @@ def _download_data_macro_predictors(
     end_date: str = None,
     type: str = None,
     sheet_id: str = "1bM7vCWd3WOt95Sf9qjLPZjoiafgF_8EG",
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process macro predictor data.
 
@@ -502,7 +599,7 @@ def _download_data_macro_predictors(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with processed data, filtered by the specified
         date range and including financial metrics.
 
@@ -553,14 +650,14 @@ def _download_data_macro_predictors(
                 f"{sheet_id}/gviz/tq?tqx=out:csv&sheet="
                 f"{dataset.capitalize()}"
             )
-            raw_data = pd.read_csv(macro_sheet_url)
+            raw_data = _fetch_csv(macro_sheet_url)
         except Exception as e:
             warnings.warn(
                 f"Returning an empty dataset due to download failure: {e}",
                 UserWarning,
                 stacklevel=2,
             )
-            return pd.DataFrame()
+            return pl.DataFrame()
     else:
         raise ValueError(
             f"Unsupported dataset: {dataset!r}. "
@@ -568,72 +665,56 @@ def _download_data_macro_predictors(
         )
 
     if dataset == "monthly":
-        raw_data = raw_data.assign(
-            date=lambda x: pd.to_datetime(x["yyyymm"], format="%Y%m")
-        ).drop(columns=["yyyymm"])
+        raw_data = raw_data.with_columns(
+            (pl.col("yyyymm").cast(pl.String) + "01")
+            .str.to_date("%Y%m%d")
+            .alias("date")
+        ).drop("yyyymm")
     if dataset == "quarterly":
-        raw_data = raw_data.assign(
-            date=lambda x: pd.to_datetime(
-                x["yyyyq"].astype(str).str[:4]
-                + "-"
-                + (x["yyyyq"].astype(str).str[4].astype(int) * 3 - 2).astype(
-                    str
-                )
-                + "-01"
-            )
-        ).drop(columns=["yyyyq"])
+        raw_data = raw_data.with_columns(
+            pl.date(
+                pl.col("yyyyq").cast(pl.String).str.slice(0, 4).cast(pl.Int32),
+                pl.col("yyyyq").cast(pl.String).str.slice(4, 1).cast(pl.Int32)
+                * 3
+                - 2,
+                1,
+            ).alias("date")
+        ).drop("yyyyq")
     if dataset == "annual":
-        raw_data = raw_data.assign(
-            date=lambda x: pd.to_datetime(x["yyyy"].astype(str) + "-01-01")
-        ).drop(columns=["yyyy"])
+        raw_data = raw_data.with_columns(
+            pl.date(pl.col("yyyy").cast(pl.Int32), 1, 1).alias("date")
+        ).drop("yyyy")
 
-    raw_data = raw_data.apply(
-        lambda x: (
-            pd.to_numeric(x.astype(str).str.replace(",", ""), errors="coerce")
-            if x.dtype == "object" or pd.api.types.is_string_dtype(x)
-            else x
-        )
-    )
-    raw_data = raw_data.apply(
-        lambda x: (
-            pd.to_numeric(x.astype(str).str.replace(",", ""), errors="coerce")
-            if pd.api.types.is_string_dtype(x) or x.dtype == "object"
-            else x
-        )
-    ).assign(
-        IndexDiv=lambda df: df["Index"] + df["D12"],
-        logret=lambda df: (
-            df["IndexDiv"]
-            .apply(lambda x: np.nan if pd.isna(x) else np.log(x))
-            .diff()
-        ),
-        rp_div=lambda df: df["logret"].shift(-1) - df["Rfree"],
-        log_d12=lambda df: df["D12"].apply(
-            lambda x: np.nan if pd.isna(x) else np.log(x)
-        ),
-        log_e12=lambda df: df["E12"].apply(
-            lambda x: np.nan if pd.isna(x) else np.log(x)
-        ),
-        dp=lambda df: (
-            df["log_d12"]
-            - df["Index"].apply(lambda x: np.nan if pd.isna(x) else np.log(x))
-        ),
-        dy=lambda df: (
-            df["log_d12"]
-            - df["Index"]
-            .shift(1)
-            .apply(lambda x: np.nan if pd.isna(x) else np.log(x))
-        ),
-        ep=lambda df: (
-            df["log_e12"]
-            - df["Index"].apply(lambda x: np.nan if pd.isna(x) else np.log(x))
-        ),
-        de=lambda df: df["log_d12"] - df["log_e12"],
-        tms=lambda df: df["lty"] - df["tbl"],
-        dfy=lambda df: df["BAA"] - df["AAA"],
+    # Coerce string columns (e.g. with thousands separators) to numbers.
+    raw_data = raw_data.with_columns(
+        [
+            pl.col(c).str.replace_all(",", "").cast(pl.Float64, strict=False)
+            for c, dtype in raw_data.schema.items()
+            if dtype == pl.String
+        ]
     )
 
-    raw_data = raw_data[
+    raw_data = (
+        raw_data.with_columns(
+            (pl.col("Index") + pl.col("D12")).alias("IndexDiv")
+        )
+        .with_columns(
+            pl.col("IndexDiv").log().diff().alias("logret"),
+            pl.col("D12").log().alias("log_d12"),
+            pl.col("E12").log().alias("log_e12"),
+        )
+        .with_columns(
+            (pl.col("logret").shift(-1) - pl.col("Rfree")).alias("rp_div"),
+            (pl.col("log_d12") - pl.col("Index").log()).alias("dp"),
+            (pl.col("log_d12") - pl.col("Index").shift(1).log()).alias("dy"),
+            (pl.col("log_e12") - pl.col("Index").log()).alias("ep"),
+            (pl.col("log_d12") - pl.col("log_e12")).alias("de"),
+            (pl.col("lty") - pl.col("tbl")).alias("tms"),
+            (pl.col("BAA") - pl.col("AAA")).alias("dfy"),
+        )
+    )
+
+    raw_data = raw_data.select(
         [
             "date",
             "rp_div",
@@ -651,20 +732,29 @@ def _download_data_macro_predictors(
             "dfy",
             "infl",
         ]
-    ]
+    )
     raw_data = raw_data.rename(
-        columns={col: col.replace("/", "") for col in raw_data.columns}
-    ).dropna()
+        {col: col.replace("/", "") for col in raw_data.columns}
+    )
+    raw_data = raw_data.with_columns(
+        [
+            pl.col(c).fill_nan(None)
+            for c, dtype in raw_data.schema.items()
+            if dtype in (pl.Float32, pl.Float64)
+        ]
+    ).drop_nulls()
 
     if start_date and end_date:
-        raw_data = raw_data.query("@start_date <= date <= @end_date")
+        raw_data = raw_data.filter(
+            pl.col("date").is_between(start_date, end_date)
+        )
 
-    return raw_data.reset_index(drop=True)
+    return raw_data
 
 
 def _download_data_constituents(
     index: str = None, dataset: str = None, **kwargs
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download constituent data for a given stock index.
 
@@ -696,7 +786,7 @@ def _download_data_constituents(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with five columns:
 
         - 'symbol': the ticker symbol of the equity constituent.
@@ -730,18 +820,15 @@ def _download_data_constituents(
     symbol_blacklist = {"", "-", "USD", "GXU4", "EUR", "MARGIN_EUR", "MLIFT"}
     supported_indexes = list_supported_indexes()
 
-    if index not in supported_indexes["index"].values:
+    if index not in supported_indexes["index"].to_list():
         raise ValueError(
             "The index '{index}' is not supported. "
             f"Supported indexes: {', '.join(supported_indexes['index'])}"
         )
 
-    url = supported_indexes.loc[
-        supported_indexes["index"] == index, "url"
-    ].values[0]
-    skip_rows = supported_indexes.loc[
-        supported_indexes["index"] == index, "skip"
-    ].values[0]
+    index_row = supported_indexes.filter(pl.col("index") == index)
+    url = index_row.get_column("url").item()
+    skip_rows = int(index_row.get_column("skip").item())
     headers = {"User-Agent": _get_random_user_agent()}
 
     try:
@@ -755,31 +842,56 @@ def _download_data_constituents(
             "Please check the index name or try again later."
         )
 
-    df = pd.read_csv(io.StringIO(response.text), skiprows=skip_rows)
+    df = pl.read_csv(
+        response.text.encode("utf-8"),
+        skip_rows=skip_rows,
+        truncate_ragged_lines=True,
+        infer_schema_length=None,
+    )
 
     if "Anlageklasse" in df.columns:
-        df = df[df["Anlageklasse"] == "Aktien"][
-            ["Emittententicker", "Name", "Standort", "Börse"]
-        ]
-        df.columns = ["symbol", "name", "location", "exchange"]
+        df = df.filter(pl.col("Anlageklasse") == "Aktien").select(
+            pl.col("Emittententicker").alias("symbol"),
+            pl.col("Name").alias("name"),
+            pl.col("Standort").alias("location"),
+            pl.col("Börse").alias("exchange"),
+        )
     elif "Asset Class" in df.columns:
-        df = df[df["Asset Class"] == "Equity"][
-            ["Ticker", "Name", "Location", "Exchange"]
-        ]
-        df.columns = ["symbol", "name", "location", "exchange"]
+        df = df.filter(pl.col("Asset Class") == "Equity").select(
+            pl.col("Ticker").alias("symbol"),
+            pl.col("Name").alias("name"),
+            pl.col("Location").alias("location"),
+            pl.col("Exchange").alias("exchange"),
+        )
     else:
         raise ValueError("Unknown column format in downloaded data.")
 
-    df["symbol"] = df["symbol"].astype(str).str.strip()
-    df = df[~df["symbol"].isin(symbol_blacklist)]
-    df = df[df["name"] != ""]
-    df = df[~df["name"].str.contains(index, case=False, na=False)]
-    df = df[~df["name"].str.contains("CASH", case=False, na=False)]
+    df = df.with_columns(pl.col("symbol").cast(pl.String).str.strip_chars())
+    df = df.filter(~pl.col("symbol").is_in(list(symbol_blacklist)))
+    df = df.filter(pl.col("name") != "")
+    df = df.filter(
+        ~pl.col("name").str.contains(f"(?i){index}").fill_null(False)
+    )
+    df = df.filter(~pl.col("name").str.contains("(?i)CASH").fill_null(False))
     index_no_space = re.sub(r"\s+", "", index).lower()
-    df = df[~df["name"].str.lower().str.contains(index_no_space, na=False)]
+    df = df.filter(
+        ~pl.col("name")
+        .str.to_lowercase()
+        .str.contains(index_no_space)
+        .fill_null(False)
+    )
 
-    df.loc[df["name"] == "NATIONAL BANK OF CANADA", "symbol"] = "NA"
-    df["symbol"] = df["symbol"].str.replace(" ", "-").str.replace("/", "-")
+    df = df.with_columns(
+        pl.when(pl.col("name") == "NATIONAL BANK OF CANADA")
+        .then(pl.lit("NA"))
+        .otherwise(pl.col("symbol"))
+        .alias("symbol")
+    )
+    df = df.with_columns(
+        pl.col("symbol")
+        .str.replace_all(" ", "-", literal=True)
+        .str.replace_all("/", "-", literal=True)
+    )
 
     exchange_suffixes = {
         "Xetra": ".DE",
@@ -808,11 +920,15 @@ def _download_data_constituents(
         "Shanghai Stock Exchange": ".SS",
         "Shenzhen Stock Exchange": ".SZ",
     }
-    df["symbol"] = df.apply(
-        lambda row: row["symbol"] + exchange_suffixes.get(row["exchange"], ""),
-        axis=1,
+    df = df.with_columns(
+        (
+            pl.col("symbol")
+            + pl.col("exchange").replace_strict(exchange_suffixes, default="")
+        ).alias("symbol")
     )
-    df["symbol"] = df["symbol"].str.replace("..", ".", regex=False)
+    df = df.with_columns(
+        pl.col("symbol").str.replace_all("..", ".", literal=True)
+    )
 
     currency_map = {
         "Xetra": "EUR",
@@ -841,7 +957,11 @@ def _download_data_constituents(
         "Shanghai Stock Exchange": "CNY",
         "Shenzhen Stock Exchange": "CNY",
     }
-    df["currency"] = df["exchange"].map(currency_map).fillna("USD")
+    df = df.with_columns(
+        pl.col("exchange")
+        .replace_strict(currency_map, default="USD")
+        .alias("currency")
+    )
 
     return df
 
@@ -850,7 +970,7 @@ def _download_data_fred(
     series: str | list,
     start_date: str = None,
     end_date: str = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process data from FRED.
 
@@ -878,7 +998,7 @@ def _download_data_fred(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing the processed data with three columns:
 
         - 'date': the date corresponding to the data point.
@@ -896,6 +1016,7 @@ def _download_data_fred(
     if isinstance(series, str):
         series = [series]
     start_date, end_date = _validate_dates(start_date, end_date)
+    empty_schema = {"date": pl.Date, "series": pl.String, "value": pl.Float64}
     fred_data = []
     for s in series:
         urls = [
@@ -924,24 +1045,24 @@ def _download_data_fred(
                     continue
 
                 try:
-                    raw_data = (
-                        pd.read_csv(pd.io.common.StringIO(response.text))
-                        .rename(columns=lambda c: c.strip().lower())
-                        .assign(
-                            date=lambda x: pd.to_datetime(
-                                x[x.columns[x.columns.str.contains("date")][0]]
-                            ),
-                            value=lambda x: pd.to_numeric(
-                                x[
-                                    x.columns[~x.columns.str.contains("date")][
-                                        0
-                                    ]
-                                ],
-                                errors="coerce",
-                            ),
-                            series=s,
-                        )
-                        .get(["date", "series", "value"])
+                    parsed = pl.read_csv(
+                        response.text.encode("utf-8"), infer_schema_length=0
+                    )
+                    parsed = parsed.rename(
+                        {c: c.strip().lower() for c in parsed.columns}
+                    )
+                    date_col = [c for c in parsed.columns if "date" in c][0]
+                    value_col = [
+                        c for c in parsed.columns if "date" not in c
+                    ][0]
+                    raw_data = parsed.select(
+                        pl.col(date_col)
+                        .str.to_date(strict=False)
+                        .alias("date"),
+                        pl.lit(s).alias("series"),
+                        pl.col(value_col)
+                        .cast(pl.Float64, strict=False)
+                        .alias("value"),
                     )
                     fred_data.append(raw_data)
                     success = True
@@ -958,22 +1079,24 @@ def _download_data_fred(
                 UserWarning,
                 stacklevel=2,
             )
-            fred_data.append(pd.DataFrame(columns=["date", "series", "value"]))
+            fred_data.append(pl.DataFrame(schema=empty_schema))
 
-    fred_data = pd.concat(fred_data, ignore_index=True)
+    fred_data = pl.concat(fred_data, how="vertical")
     if start_date and end_date:
-        fred_data = fred_data.query(
-            "@start_date <= date <= @end_date"
-        ).reset_index(drop=True)
+        fred_data = fred_data.filter(
+            pl.col("date").is_between(start_date, end_date)
+        )
     return fred_data
 
 
 _FRED_MD_BASE = "https://www.stlouisfed.org/-/media/project/frbstl/stlouisfed/research/fred-md"
 
-# Per-dataset spec: subdirectory, individual-vintage filename suffix ('md'/'qd'), and full-history
-# archive routing ranges (first, last, zip url). A specific historical vintage is extracted from
-# whichever archive covers it; more recent vintages are hosted individually. The clean Sitecore media
-# path resolves without the rotating '?sc_lang=&hash=' cache-buster query string.
+# Per-dataset spec: subdirectory, individual-vintage filename suffix
+# ('md'/'qd'), and full-history archive routing ranges (first, last, zip
+# url). A specific historical vintage is extracted from whichever
+# archive covers it; more recent vintages are hosted individually. The
+# clean Sitecore media path resolves without the rotating
+# '?sc_lang=&hash=' cache-buster query string.
 _FRED_MD_SPEC = {
     "FRED-MD": {
         "sub": "monthly",
@@ -1006,10 +1129,12 @@ _VINTAGE_M = re.compile(r"(\d{4})m(\d{1,2})")
 
 
 def _apply_fred_md_tcode(x: np.ndarray, code: int) -> np.ndarray:
-    """Apply a McCracken-Ng stationarity transform (tcode 1-7) to a level series.
+    """Apply a McCracken-Ng stationarity transform (tcode 1-7) to a
+    level series.
 
-    1 level, 2 diff, 3 diff^2, 4 log, 5 dlog, 6 dlog^2, 7 diff(x_t/x_{t-1} - 1).
-    All are causal (use only current and past values).
+    1 level, 2 diff, 3 diff^2, 4 log, 5 dlog, 6 dlog^2,
+    7 diff(x_t/x_{t-1} - 1). All are causal (use only current and past
+    values).
     """
     x = np.asarray(x, dtype=float)
     if code == 1:
@@ -1031,7 +1156,8 @@ def _apply_fred_md_tcode(x: np.ndarray, code: int) -> np.ndarray:
 
 
 def _fetch_fred_md_text(url: str) -> str:
-    """GET a FRED-MD/QD CSV (Akamai-safe via curl_cffi impersonation); raise on failure."""
+    """GET a FRED-MD/QD CSV (Akamai-safe via curl_cffi impersonation);
+    raise on failure."""
     headers = {"User-Agent": _get_random_user_agent()}
     response = requests.get(
         url, headers=headers, impersonate="chrome110", timeout=60
@@ -1051,53 +1177,70 @@ def _fetch_fred_md_bytes(url: str) -> bytes:
 
 
 def _looks_like_fred_md(text: str) -> bool:
-    """True if ``text`` is a FRED-MD/QD CSV (first cell ``sasdate``) — guards 200-OK HTML pages."""
+    """True if ``text`` is a FRED-MD/QD CSV (first cell ``sasdate``) —
+    guards 200-OK HTML pages."""
     first = text.lstrip("﻿").splitlines()[0] if text.strip() else ""
     return first.split(",")[0].strip().lower() == "sasdate"
 
 
 def _vintage_label(name: str) -> str | None:
-    """Extract a ``YYYY-MM`` vintage label from an archived filename, or None."""
+    """Extract a ``YYYY-MM`` vintage label from an archived filename,
+    or None."""
     m = _VINTAGE_DASH.search(name) or _VINTAGE_M.search(name)
     return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}" if m else None
 
 
-def _fred_md_wide(text: str, transform: bool) -> pd.DataFrame:
-    """Parse one FRED-MD/QD vintage CSV into a wide frame ``[date, <series...>]``.
+def _fred_md_wide(text: str, transform: bool) -> pl.DataFrame:
+    """Parse one FRED-MD/QD vintage CSV into a wide frame
+    ``[date, <series...>]``.
 
-    Row 1 is the header (``sasdate`` + series), row 2 the ``Transform:`` row of tcodes, and the body
-    the levels. With ``transform=True`` each series' McCracken-Ng stationarity transform (tcode) is
-    applied per vintage (causal, so point-in-time safe); ``transform=False`` keeps raw levels.
+    Row 1 is the header (``sasdate`` + series), row 2 the
+    ``Transform:`` row of tcodes, and the body the levels. With
+    ``transform=True`` each series' McCracken-Ng stationarity transform
+    (tcode) is applied per vintage (causal, so point-in-time safe);
+    ``transform=False`` keeps raw levels.
     """
-    raw = pd.read_csv(io.StringIO(text))
+    raw = pl.read_csv(text.encode("utf-8"), infer_schema_length=0)
     date_col = raw.columns[0]
     series_cols = list(raw.columns[1:])
-    tcodes = {c: int(float(raw.iloc[0][c])) for c in series_cols}
+    tcodes = {c: int(float(raw[0, c])) for c in series_cols}
 
-    body = raw.iloc[1:]
-    ref = pd.to_datetime(body[date_col], format="%m/%d/%Y", errors="coerce")
-    keep = ref.notna()
-    levels = body.loc[keep, series_cols].apply(pd.to_numeric, errors="coerce")
-    levels.index = pd.DatetimeIndex(ref[keep], name="date")
+    body = raw.slice(1)
+    body = body.with_columns(
+        pl.col(date_col)
+        .str.strip_chars()
+        .str.to_date("%m/%d/%Y", strict=False)
+        .alias("__fred_md_date")
+    ).filter(pl.col("__fred_md_date").is_not_null())
+    levels = body.select(
+        pl.col("__fred_md_date").alias("date"),
+        *[pl.col(c).cast(pl.Float64, strict=False) for c in series_cols],
+    )
     if transform:
-        levels = pd.DataFrame(
-            {
-                c: _apply_fred_md_tcode(levels[c].to_numpy(), tcodes[c])
+        levels = levels.with_columns(
+            [
+                pl.Series(
+                    c,
+                    _apply_fred_md_tcode(
+                        levels.get_column(c).to_numpy(), tcodes[c]
+                    ),
+                )
                 for c in series_cols
-            },
-            index=levels.index,
-        )
-    return levels.reset_index()
+            ]
+        ).with_columns([pl.col(c).fill_nan(None) for c in series_cols])
+    return levels
 
 
 def _read_archive(
     url: str, transform: bool, want: str | None = None
-) -> dict[str, pd.DataFrame]:
-    """Download a vintage archive (zip) and parse its CSVs → ``{vintage_label: wide_frame}``.
+) -> dict[str, pl.DataFrame]:
+    """Download a vintage archive (zip) and parse its CSVs →
+    ``{vintage_label: wide_frame}``.
 
-    ``want`` returns just that one vintage (stops early); otherwise every vintage in the zip.
+    ``want`` returns just that one vintage (stops early); otherwise
+    every vintage in the zip.
     """
-    out: dict[str, pd.DataFrame] = {}
+    out: dict[str, pl.DataFrame] = {}
     with zipfile.ZipFile(io.BytesIO(_fetch_fred_md_bytes(url))) as zf:
         for name in zf.namelist():
             if not name.lower().endswith(".csv"):
@@ -1121,7 +1264,7 @@ def _download_data_fred_md(
     database: str = "FRED-MD",
     transform: bool = False,
     vintage: str = "latest",
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process a FRED-MD / FRED-QD database (McCracken-Ng).
 
@@ -1152,7 +1295,7 @@ def _download_data_fred_md(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A wide data frame ``['date', <series...>]``. For a specific ``vintage``
         or ``'all'`` a ``'vintage'`` column (the ``YYYY-MM`` release label) is
         inserted after ``date``.
@@ -1188,7 +1331,8 @@ def _download_data_fred_md(
         text = _fetch_fred_md_text(f"{_FRED_MD_BASE}/{sub}/current.csv")
         if not _looks_like_fred_md(text):
             raise ValueError(
-                "The FRED-MD/QD 'current' file was not a valid CSV; try again later."
+                "The FRED-MD/QD 'current' file was not a valid CSV; "
+                "try again later."
             )
         return _fred_md_wide(text, transform)
 
@@ -1197,17 +1341,20 @@ def _download_data_fred_md(
 
     if not re.fullmatch(r"\d{4}-\d{2}", vintage):
         raise ValueError(
-            f"vintage must be 'latest', 'all', or a 'YYYY-MM' label; got {vintage!r}."
+            f"vintage must be 'latest', 'all', or a 'YYYY-MM' label; "
+            f"got {vintage!r}."
         )
 
     frame = _download_fred_md_vintage(database, vintage, transform)
-    frame.insert(1, "vintage", vintage)
+    frame = frame.insert_column(
+        1, pl.Series("vintage", [vintage] * frame.height)
+    )
     return frame
 
 
 def _fred_md_individual_names(label: str, suffix: str) -> tuple[str, ...]:
-    """Candidate individually-hosted filenames for a vintage: e.g. '2025-04-md.csv',
-    'fred-md_2025m04.csv', '2025-04.csv'."""
+    """Candidate individually-hosted filenames for a vintage: e.g.
+    '2025-04-md.csv', 'fred-md_2025m04.csv', '2025-04.csv'."""
     year, month = label.split("-")
     return (
         f"{label}-{suffix}.csv",
@@ -1218,8 +1365,9 @@ def _fred_md_individual_names(label: str, suffix: str) -> tuple[str, ...]:
 
 def _download_fred_md_vintage(
     database: str, vintage: str, transform: bool
-) -> pd.DataFrame:
-    """One historical release: from the covering archive if any, else the individually-hosted file."""
+) -> pl.DataFrame:
+    """One historical release: from the covering archive if any, else
+    the individually-hosted file."""
     spec = _FRED_MD_SPEC[database]
     for lo, hi, url in spec["archives"]:
         if lo <= vintage <= hi:
@@ -1236,33 +1384,35 @@ def _download_fred_md_vintage(
             text = _fetch_fred_md_text(f"{_FRED_MD_BASE}/{sub}/{name}")
         except Exception:
             continue
-        if _looks_like_fred_md(
-            text
-        ):  # reject 200-OK HTML placeholders for unpublished months
+        # reject 200-OK HTML placeholders for unpublished months
+        if _looks_like_fred_md(text):
             return _fred_md_wide(text, transform)
     raise ValueError(
-        f"Could not fetch FRED-MD/QD vintage {vintage!r} (not in an archive and not "
-        "individually hosted - it may be unpublished)."
+        f"Could not fetch FRED-MD/QD vintage {vintage!r} (not in an "
+        "archive and not individually hosted - it may be unpublished)."
     )
 
 
-def _download_fred_md_all(database: str, transform: bool) -> pd.DataFrame:
-    """Every archived vintage + the individually-hosted recent ones → wide real-time panel."""
+def _download_fred_md_all(database: str, transform: bool) -> pl.DataFrame:
+    """Every archived vintage + the individually-hosted recent ones →
+    wide real-time panel."""
     spec = _FRED_MD_SPEC[database]
-    frames: dict[str, pd.DataFrame] = {}
+    frames: dict[str, pl.DataFrame] = {}
     last_archived = None
     for _lo, hi, url in spec["archives"]:
         frames.update(_read_archive(url, transform))
         last_archived = hi if last_archived is None else max(last_archived, hi)
 
     sub, suffix = spec["sub"], spec["suffix"]
-    recent = pd.period_range(
-        last_archived or "2015-01",
-        pd.Timestamp.today().to_period("M"),
-        freq="M",
+    year, month = (
+        int(part) for part in (last_archived or "2015-01").split("-")
     )
-    for period in recent:
-        label = f"{period.year:04d}-{period.month:02d}"
+    today = dt.date.today()
+    while (year, month) <= (today.year, today.month):
+        label = f"{year:04d}-{month:02d}"
+        month += 1
+        if month > 12:
+            year, month = year + 1, 1
         if label in frames:
             continue
         for name in _fred_md_individual_names(label, suffix):
@@ -1278,18 +1428,20 @@ def _download_fred_md_all(database: str, transform: bool) -> pd.DataFrame:
         raise ValueError("No FRED-MD/QD vintages could be downloaded.")
     parts = []
     for label, frame in frames.items():
-        frame = frame.copy()
-        frame.insert(1, "vintage", label)
-        parts.append(frame)
-    out = pd.concat(parts, ignore_index=True)
-    return out.sort_values(["vintage", "date"]).reset_index(drop=True)
+        parts.append(
+            frame.insert_column(
+                1, pl.Series("vintage", [label] * frame.height)
+            )
+        )
+    out = pl.concat(parts, how="diagonal")
+    return out.sort(["vintage", "date"])
 
 
 def _download_data_stock_prices(
     symbols: str | list,
     start_date: str = None,
     end_date: str = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download stock data from Yahoo Finance.
 
@@ -1312,7 +1464,7 @@ def _download_data_stock_prices(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing the downloaded stock data with columns
         'symbol', 'date', 'volume', 'open', 'low', 'high', 'close', and
         'adjusted_close'.
@@ -1336,8 +1488,9 @@ def _download_data_stock_prices(
         start_date, end_date, use_default_range=True
     )
 
-    start_timestamp = int(start_date.timestamp())
-    end_timestamp = int(end_date.timestamp())
+    # Treat the calendar dates as UTC midnight for the Yahoo query.
+    start_timestamp = calendar.timegm(start_date.timetuple())
+    end_timestamp = calendar.timegm(end_date.timetuple())
 
     all_data = []
 
@@ -1373,24 +1526,22 @@ def _download_data_stock_prices(
                 "adjclose"
             ]
 
-            df_symbol = pd.DataFrame().assign(
-                date=pd.to_datetime(
-                    pd.to_datetime(timestamps, utc=True, unit="s").date
-                ),
-                symbol=symbol,
-                volume=indicators.get("volume"),
-                open=indicators.get("open"),
-                low=indicators.get("low"),
-                high=indicators.get("high"),
-                close=indicators.get("close"),
-                adjusted_close=adjusted_close,
+            dates = [
+                dt.datetime.fromtimestamp(ts, dt.timezone.utc).date()
+                for ts in timestamps
+            ]
+            df_symbol = pl.DataFrame(
+                {
+                    "symbol": [symbol] * len(dates),
+                    "date": dates,
+                    "volume": indicators.get("volume"),
+                    "open": indicators.get("open"),
+                    "low": indicators.get("low"),
+                    "high": indicators.get("high"),
+                    "close": indicators.get("close"),
+                    "adjusted_close": adjusted_close,
+                }
             )
-
-            # Ensure symbol and date are the first columns
-            cols = list(df_symbol.columns)
-            remaining = [c for c in cols if c not in ["symbol", "date"]]
-            ordered_cols = ["symbol", "date"] + remaining
-            df_symbol = df_symbol[ordered_cols]
 
             all_data.append(df_symbol)
 
@@ -1402,13 +1553,9 @@ def _download_data_stock_prices(
                 stacklevel=2,
             )
     if all_data:
-        df_all = pd.concat(all_data, ignore_index=True)
-        cols = list(df_all.columns)
-        remaining = [c for c in cols if c not in ["symbol", "date"]]
-        ordered_cols = ["symbol", "date"] + remaining
-        df_all = df_all[ordered_cols]
+        df_all = pl.concat(all_data, how="vertical_relaxed")
     else:
-        df_all = pd.DataFrame()
+        df_all = pl.DataFrame()
     return df_all
 
 
@@ -1416,7 +1563,7 @@ def _download_data_osap(
     start_date: str = None,
     end_date: str = None,
     sheet_id: str = "1JyhcF5PRKHcputlioxlu5j5GyLo4JYyY",
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process Open Source Asset Pricing data.
 
@@ -1449,7 +1596,7 @@ def _download_data_osap(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame containing the processed data. The column names
         are converted to snake_case, the ``date`` column is aligned to
         the beginning of the month, all predictor columns (long-short
@@ -1472,16 +1619,16 @@ def _download_data_osap(
     url = f"https://drive.google.com/uc?export=download&id={sheet_id}"
 
     try:
-        raw_data = pd.read_csv(url)
+        raw_data = _fetch_csv(url)
     except Exception:
         warnings.warn(
             "Returning an empty dataset due to download failure.",
             UserWarning,
             stacklevel=2,
         )
-        return pd.DataFrame()
+        return pl.DataFrame()
 
-    if raw_data.empty:
+    if raw_data.is_empty():
         warnings.warn(
             "Returning an empty dataset due to download failure.",
             UserWarning,
@@ -1490,25 +1637,30 @@ def _download_data_osap(
         return raw_data
 
     if "date" in raw_data.columns:
-        raw_data["date"] = (
-            pd.to_datetime(raw_data["date"], errors="coerce")
-            .dt.to_period("M")
-            .dt.start_time
-        )
+        if raw_data.schema["date"] == pl.String:
+            raw_data = raw_data.with_columns(
+                pl.col("date").str.to_date(strict=False)
+            )
+        else:
+            raw_data = raw_data.with_columns(pl.col("date").cast(pl.Date))
+        raw_data = raw_data.with_columns(pl.col("date").dt.truncate("1mo"))
 
-    raw_data.columns = [
-        _transfrom_to_snake_case(col) for col in raw_data.columns
-    ]
+    raw_data = raw_data.rename(
+        {col: _transfrom_to_snake_case(col) for col in raw_data.columns}
+    )
 
     # All columns except the date are long-short returns in percent, so
     # scale them to plain numeric (decimal) returns.
-    return_columns = [col for col in raw_data.columns if col != "date"]
-    raw_data[return_columns] = raw_data[return_columns] / 100
+    raw_data = raw_data.with_columns(
+        [pl.col(c) / 100 for c in raw_data.columns if c != "date"]
+    )
 
     if start_date and end_date:
-        raw_data = raw_data.query("@start_date <= date <= @end_date")
+        raw_data = raw_data.filter(
+            pl.col("date").is_between(start_date, end_date)
+        )
 
-    return raw_data.reset_index(drop=True)
+    return raw_data
 
 
 def _download_data_pastor_stambaugh(
@@ -1518,7 +1670,7 @@ def _download_data_pastor_stambaugh(
         "https://faculty.chicagobooth.edu/-/media/faculty/lubos-pastor/"
         "data/liq_data_1962_2025.txt"
     ),
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process Pastor-Stambaugh liquidity factors.
 
@@ -1535,7 +1687,7 @@ def _download_data_pastor_stambaugh(
     in the source data, so no rescaling is applied. The traded
     liquidity factor is only available from 1968 onward; earlier
     observations are coded as -99 in the source file and are returned
-    as NaN.
+    as missing values.
 
     Parameters
     ----------
@@ -1555,7 +1707,7 @@ def _download_data_pastor_stambaugh(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with the columns 'date' (aligned to the
         beginning of the month), 'agg_liq' (levels of aggregate
         liquidity), 'innov_liq' (innovations in aggregate liquidity,
@@ -1581,11 +1733,8 @@ def _download_data_pastor_stambaugh(
     start_date, end_date = _validate_dates(start_date, end_date)
 
     try:
-        raw_data = pd.read_csv(
+        raw_data = _fetch_whitespace_table(
             url,
-            sep=r"\s+",
-            comment="%",
-            header=None,
             names=["month", "agg_liq", "innov_liq", "traded_liq"],
         )
     except Exception:
@@ -1594,9 +1743,9 @@ def _download_data_pastor_stambaugh(
             UserWarning,
             stacklevel=2,
         )
-        return pd.DataFrame()
+        return pl.DataFrame()
 
-    if raw_data.empty:
+    if raw_data.is_empty():
         warnings.warn(
             "Returning an empty dataset due to download failure.",
             UserWarning,
@@ -1605,21 +1754,29 @@ def _download_data_pastor_stambaugh(
         return raw_data
 
     # The traded factor is coded -99 before it becomes available (1968).
-    processed_data = raw_data.assign(
-        date=lambda x: pd.to_datetime(x["month"].astype(str), format="%Y%m")
-    )
     liquidity_columns = ["agg_liq", "innov_liq", "traded_liq"]
-    processed_data[liquidity_columns] = processed_data[
-        liquidity_columns
-    ].replace(-99, np.nan)
-    processed_data = processed_data[["date", *liquidity_columns]]
+    processed_data = raw_data.with_columns(
+        (pl.col("month").cast(pl.String) + "01")
+        .str.to_date("%Y%m%d")
+        .alias("date")
+    )
+    processed_data = processed_data.with_columns(
+        [
+            pl.when(pl.col(c) == -99)
+            .then(None)
+            .otherwise(pl.col(c))
+            .alias(c)
+            for c in liquidity_columns
+        ]
+    )
+    processed_data = processed_data.select(["date", *liquidity_columns])
 
     if start_date and end_date:
-        processed_data = processed_data.query(
-            "@start_date <= date <= @end_date"
+        processed_data = processed_data.filter(
+            pl.col("date").is_between(start_date, end_date)
         )
 
-    return processed_data.reset_index(drop=True)
+    return processed_data
 
 
 def _download_data_stambaugh_yuan(
@@ -1627,7 +1784,7 @@ def _download_data_stambaugh_yuan(
     start_date: str = None,
     end_date: str = None,
     url: str = "https://finance.wharton.upenn.edu/~stambaug/",
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process Stambaugh-Yuan mispricing factors.
 
@@ -1666,7 +1823,7 @@ def _download_data_stambaugh_yuan(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with the columns 'date' (aligned to the
         beginning of the month for monthly data), 'mkt_excess' (the
         market excess return), 'smb' (size), 'mgmt' (the management
@@ -1701,16 +1858,16 @@ def _download_data_stambaugh_yuan(
     file = "M4d.csv" if dataset == "daily" else "M4.csv"
 
     try:
-        raw_data = pd.read_csv(f"{url}{file}")
+        raw_data = _fetch_csv(f"{url}{file}")
     except Exception:
         warnings.warn(
             "Returning an empty dataset due to download failure.",
             UserWarning,
             stacklevel=2,
         )
-        return pd.DataFrame()
+        return pl.DataFrame()
 
-    if raw_data.empty:
+    if raw_data.is_empty():
         warnings.warn(
             "Returning an empty dataset due to download failure.",
             UserWarning,
@@ -1720,34 +1877,38 @@ def _download_data_stambaugh_yuan(
 
     # The monthly file keys rows by YYYYMM, the daily file by YYYYMMDD.
     if dataset == "daily":
-        processed_data = raw_data.assign(
-            date=lambda x: pd.to_datetime(
-                x["DATE"].astype(str), format="%Y%m%d"
-            )
+        processed_data = raw_data.with_columns(
+            pl.col("DATE")
+            .cast(pl.String)
+            .str.to_date("%Y%m%d")
+            .alias("date")
         )
     else:
-        processed_data = raw_data.assign(
-            date=lambda x: pd.to_datetime(
-                x["YYYYMM"].astype(str), format="%Y%m"
-            )
+        processed_data = raw_data.with_columns(
+            (pl.col("YYYYMM").cast(pl.String) + "01")
+            .str.to_date("%Y%m%d")
+            .alias("date")
         )
 
     processed_data = processed_data.rename(
-        columns={
+        {
             "MKTRF": "mkt_excess",
             "SMB": "smb",
             "MGMT": "mgmt",
             "PERF": "perf",
             "RF": "risk_free",
-        }
-    )[["date", "mkt_excess", "smb", "mgmt", "perf", "risk_free"]]
+        },
+        strict=False,
+    ).select(["date", "mkt_excess", "smb", "mgmt", "perf", "risk_free"])
 
     if start_date and end_date:
-        filtered_data = processed_data.query("@start_date <= date <= @end_date")
+        filtered_data = processed_data.filter(
+            pl.col("date").is_between(start_date, end_date)
+        )
 
-        if filtered_data.empty:
-            available_start = processed_data["date"].min().date()
-            available_end = processed_data["date"].max().date()
+        if filtered_data.is_empty():
+            available_start = processed_data.get_column("date").min()
+            available_end = processed_data.get_column("date").max()
             warnings.warn(
                 "The requested date range lies outside the available "
                 "Stambaugh-Yuan data. Available data range: "
@@ -1758,7 +1919,7 @@ def _download_data_stambaugh_yuan(
 
         processed_data = filtered_data
 
-    return processed_data.reset_index(drop=True)
+    return processed_data
 
 
 _JKP_BASE_URL = "https://jkpfactors-data.s3.amazonaws.com"
@@ -1940,7 +2101,7 @@ def _build_jkp_reference_url(dataset: str, frequency: str) -> str:
         return f"{base_url}/return_cutoffs.csv"
 
 
-def _download_jkp_file(url: str, max_tries: int = 5) -> pd.DataFrame:
+def _download_jkp_file(url: str, max_tries: int = 5) -> pl.DataFrame:
     """
     Download and read a zipped Global Factor Data CSV file.
 
@@ -1953,7 +2114,7 @@ def _download_jkp_file(url: str, max_tries: int = 5) -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         The first CSV file found in the archive.
 
     Raises
@@ -1984,11 +2145,10 @@ def _download_jkp_file(url: str, max_tries: int = 5) -> pd.DataFrame:
         csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
         if not csv_names:
             raise ValueError("No CSV file found in the downloaded archive.")
-        with zf.open(csv_names[0]) as f:
-            return pd.read_csv(f, na_values=["na"])
+        return pl.read_csv(zf.read(csv_names[0]), null_values=["na"])
 
 
-def _download_jkp_csv(url: str, max_tries: int = 5) -> pd.DataFrame:
+def _download_jkp_csv(url: str, max_tries: int = 5) -> pl.DataFrame:
     """
     Download and read a plain Global Factor Data CSV file.
 
@@ -2001,7 +2161,7 @@ def _download_jkp_csv(url: str, max_tries: int = 5) -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         The parsed CSV file.
 
     Raises
@@ -2017,25 +2177,27 @@ def _download_jkp_csv(url: str, max_tries: int = 5) -> pd.DataFrame:
                 url, headers=headers, timeout=180, impersonate="chrome120"
             )
             response.raise_for_status()
-            return pd.read_csv(io.StringIO(response.text), na_values=["na"])
+            return pl.read_csv(
+                io.BytesIO(response.content), null_values=["na"]
+            )
         except Exception as e:
             last_error = e
     raise last_error
 
 
 def _process_jkp_data(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     date_col: str,
     frequency: str,
     start_date,
     end_date,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Normalize dates and filter a Global Factor Data table.
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Raw data with a date-like column named 'date_col'.
     date_col : str
         Name of the date column in 'data'. Renamed to 'date' if it
@@ -2043,28 +2205,30 @@ def _process_jkp_data(
     frequency : str
         Either 'monthly' or 'daily'. Monthly dates are aligned to the
         beginning of the month.
-    start_date, end_date : Timestamp or None
+    start_date, end_date : datetime.date or None
         Filter bounds. No filtering is applied if either is None.
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         The processed data, filtered by the specified date range if
         both 'start_date' and 'end_date' are provided.
     """
-    data = data.copy()
     if date_col != "date":
-        data = data.rename(columns={date_col: "date"})
+        data = data.rename({date_col: "date"})
 
-    data["date"] = pd.to_datetime(data["date"])
+    if data.schema["date"] == pl.String:
+        data = data.with_columns(pl.col("date").str.to_date(strict=False))
+    else:
+        data = data.with_columns(pl.col("date").cast(pl.Date))
 
     if frequency == "monthly":
-        data["date"] = data["date"].dt.to_period("M").dt.start_time
+        data = data.with_columns(pl.col("date").dt.truncate("1mo"))
 
     if start_date is not None and end_date is not None:
-        data = data.query("@start_date <= date <= @end_date")
+        data = data.filter(pl.col("date").is_between(start_date, end_date))
 
-    return data.reset_index(drop=True)
+    return data
 
 
 def _download_data_jkp(
@@ -2076,7 +2240,7 @@ def _download_data_jkp(
     weighting: str = "vw_cap",
     start_date: str = None,
     end_date: str = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process Global Factor Data.
 
@@ -2141,7 +2305,7 @@ def _download_data_jkp(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with the processed data. The 'date' column is
         aligned to the beginning of the month for monthly data, and
         all returns are plain numeric (decimal) values. The remaining
@@ -2199,9 +2363,9 @@ def _download_data_jkp(
         try:
             raw_data = _download_jkp_csv(url)
         except Exception:
-            raw_data = pd.DataFrame()
+            raw_data = pl.DataFrame()
 
-        if raw_data.empty:
+        if raw_data.is_empty():
             warnings.warn(
                 "Returning an empty dataset due to a download or "
                 "parsing failure.",
@@ -2235,7 +2399,7 @@ def _download_data_jkp(
             UserWarning,
             stacklevel=2,
         )
-        return pd.DataFrame()
+        return pl.DataFrame()
 
     selector = classification if dataset == "industry" else factors
     _validate_jkp_selection(availability, dataset, region, selector, frequency)
@@ -2245,9 +2409,9 @@ def _download_data_jkp(
     try:
         raw_data = _download_jkp_file(url)
     except Exception:
-        raw_data = pd.DataFrame()
+        raw_data = pl.DataFrame()
 
-    if raw_data.empty:
+    if raw_data.is_empty():
         warnings.warn(
             "Returning an empty dataset due to a download or parsing failure.",
             UserWarning,
@@ -2265,6 +2429,8 @@ def _download_data_jkp(
     )
 
     if dataset == "portfolios" and "pf" in processed_data.columns:
-        processed_data["pf"] = processed_data["pf"].astype(int)
+        processed_data = processed_data.with_columns(
+            pl.col("pf").cast(pl.Int64)
+        )
 
     return processed_data

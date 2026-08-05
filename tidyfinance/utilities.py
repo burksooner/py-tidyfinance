@@ -4,16 +4,34 @@ import warnings
 import webbrowser
 
 import numpy as np
-import pandas as pd
+import polars as pl
+
+_SUMMARY_QUANTILES_BASIC = (0.50,)
+_SUMMARY_QUANTILES_DETAIL = (
+    0.01,
+    0.05,
+    0.10,
+    0.25,
+    0.50,
+    0.75,
+    0.90,
+    0.95,
+    0.99,
+)
+
+
+def _quantile_label(p: float) -> str:
+    """Return the R-style quantile column label, e.g. 0.05 -> 'q05'."""
+    return f"q{round(p * 100):02d}"
 
 
 def create_summary_statistics(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     variables: list,
     by: str = None,
     detail: bool = False,
     drop_na: bool = False,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Create summary statistics for specified variables.
 
     Computes a set of summary statistics for numeric and boolean
@@ -28,22 +46,17 @@ def create_summary_statistics(
     Boolean columns are summarized as their numeric equivalent — for
     example, the 'mean' of a boolean column is the proportion of True.
 
-    The basic set of summary statistics includes the count of non-NaN
-    values (n), mean, standard deviation (sd), minimum (min), median
-    (q50), and maximum (max). If 'detail' is True, the function also
-    computes the 1st, 5th, 10th, 25th, 75th, 90th, 95th, and 99th
-    percentiles.
-
-    For each selected variable the function reports the number of
-    observations (count), mean, standard deviation (std), minimum,
-    median (50%), and maximum. When ``detail`` is True, the additional
-    quantiles 1%, 5%, 10%, 25%, 75%, 90%, 95%, and 99% are included.
-    Statistics are computed for the whole dataset, or separately for
-    each group when ``by`` is supplied.
+    The basic set of summary statistics includes the count of non-null
+    values ('n'), 'mean', standard deviation ('sd'), minimum ('min'),
+    median ('q50'), and maximum ('max'). If 'detail' is True, the
+    function also computes the 1st, 5th, 10th, 25th, 75th, 90th, 95th,
+    and 99th percentiles ('q01' through 'q99'). Statistics are computed
+    for the whole dataset, or separately for each group when 'by' is
+    supplied.
 
     Parameters
     ----------
-    data : pd.DataFrame
+    data : pl.DataFrame
         Data frame containing the variables to be summarized.
     variables : list of str
         List of column names in the data frame to summarize. These
@@ -55,15 +68,15 @@ def create_summary_statistics(
     detail : bool, default False
         Whether to compute detailed summary statistics, including
         additional quantiles. When False, computes basic statistics
-        (n, mean, sd, min, median, max). When True, additional
-        quantiles (1%, 5%, 10%, 25%, 75%, 90%, 95%, 99%) are computed.
+        (n, mean, sd, min, q50, max). When True, additional quantiles
+        (q01, q05, q10, q25, q75, q90, q95, q99) are computed.
     drop_na : bool, default False
         Whether to drop missing values for each variable before
         summarizing.
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         Data frame with summary statistics for each selected variable.
         If 'by' is specified, the output includes the grouping variable
         as well. Each row represents a variable (and a group if 'by' is
@@ -72,11 +85,10 @@ def create_summary_statistics(
     Examples
     --------
     ```python
-    import numpy as np
-    import pandas as pd
+    import polars as pl
     from tidyfinance import create_summary_statistics
-    data = pd.DataFrame({
-        'ret': [0.01, -0.02, 0.03, np.nan, 0.005],
+    data = pl.DataFrame({
+        'ret': [0.01, -0.02, 0.03, None, 0.005],
         'size': [100, 200, 150, 300, 250],
         'group': ['A', 'A', 'B', 'B', 'A'],
     })
@@ -88,11 +100,12 @@ def create_summary_statistics(
     create_summary_statistics(data, ['ret'], detail=True)
     ```
     """
-    # Check that all specified variables are numeric or boolean
     non_numeric_vars = [
         var
         for var in variables
-        if not pd.api.types.is_numeric_dtype(data[var].dtype)
+        if not (
+            data.schema[var].is_numeric() or data.schema[var] == pl.Boolean
+        )
     ]
     if non_numeric_vars:
         raise ValueError(
@@ -100,49 +113,57 @@ def create_summary_statistics(
             f"{', '.join(non_numeric_vars)}"
         )
 
-    # Cast boolean columns to float so they survive `describe()`, which
-    # drops bool dtype by default. The mean of the cast column then
-    # equals the proportion of True in the original.
-    bool_cols = [
-        v for v in variables if pd.api.types.is_bool_dtype(data[v].dtype)
-    ]
+    # Cast boolean columns to float so their mean equals the proportion
+    # of True in the original.
+    bool_cols = [v for v in variables if data.schema[v] == pl.Boolean]
     if bool_cols:
-        data = data.copy()
-        for c in bool_cols:
-            data[c] = data[c].astype(float)
+        data = data.with_columns(
+            [pl.col(c).cast(pl.Float64) for c in bool_cols]
+        )
 
-    # Drop missing values if specified
     if drop_na:
-        data = data.dropna(subset=variables)
+        data = data.drop_nulls(subset=variables)
 
-    # Compute summary statistics using describe
-    percentiles = (
-        [0.5]
-        if not detail
-        else [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
+    quantiles = (
+        _SUMMARY_QUANTILES_DETAIL if detail else _SUMMARY_QUANTILES_BASIC
     )
 
-    if by:
-        summary_df = (
-            data.groupby(by)
-            .describe(percentiles=percentiles)
-            .get(variables)
-            .reset_index()
-            .rename(columns={"index": "variable"})
-        )
-    else:
-        summary_df = (
-            data.get(variables)
-            .describe(percentiles=percentiles)
-            .transpose()
-            .reset_index()
-            .rename(columns={"index": "variable"})
-        )
+    id_cols = [by] if by else []
+    long = data.select(id_cols + list(variables)).unpivot(
+        index=id_cols, variable_name="variable", value_name="_value"
+    )
+    if long.schema["_value"].is_float():
+        # Treat float NaN like missing so statistics ignore it, matching
+        # the pandas/R behavior for NA values.
+        long = long.with_columns(pl.col("_value").fill_nan(None))
 
-    return summary_df
+    aggs = [
+        pl.col("_value").count().alias("n"),
+        pl.col("_value").mean().alias("mean"),
+        pl.col("_value").std().alias("sd"),
+        pl.col("_value").min().alias("min"),
+        *[
+            pl.col("_value")
+            .quantile(p, interpolation="linear")
+            .alias(_quantile_label(p))
+            for p in quantiles
+        ],
+        pl.col("_value").max().alias("max"),
+    ]
+
+    group_cols = id_cols + ["variable"]
+    result = long.group_by(group_cols, maintain_order=True).agg(aggs)
+
+    # Order quantile columns around the median as documented.
+    ordered_stats = (
+        ["n", "mean", "sd", "min"]
+        + [_quantile_label(p) for p in quantiles]
+        + ["max"]
+    )
+    return result.select(group_cols + ordered_stats).sort(group_cols)
 
 
-def list_supported_indexes() -> pd.DataFrame:
+def list_supported_indexes() -> pl.DataFrame:
     """Return a DataFrame of supported financial indexes.
 
     Each row corresponds to one index and pairs the index name with the
@@ -152,7 +173,7 @@ def list_supported_indexes() -> pd.DataFrame:
 
     Returns
     -------
-    pandas.DataFrame
+    polars.DataFrame
         A DataFrame with three columns:
 
         - 'index': name of the financial index (e.g. 'DAX', 'S&P 500').
@@ -234,12 +255,14 @@ def list_supported_indexes() -> pd.DataFrame:
             2,
         ),
     ]
-    return pd.DataFrame(data, columns=["index", "url", "skip"])
+    return pl.DataFrame(
+        data, schema=["index", "url", "skip"], orient="row"
+    )
 
 
 def list_supported_jkp_factors(
     region: str = None, dataset: str = "factors"
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Return the regions and factors supported by Global Factor Data.
 
     Queries the live availability manifest of
@@ -259,7 +282,7 @@ def list_supported_jkp_factors(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         When 'region' is 'None', a data frame with a single 'region'
         column listing the available region codes. When 'region' is
         provided, a data frame with a 'region' column and a 'factor'
@@ -295,12 +318,12 @@ def list_supported_jkp_factors(
             UserWarning,
             stacklevel=2,
         )
-        return pd.DataFrame({"region": []})
+        return pl.DataFrame(schema={"region": pl.String})
 
     regions = list(availability.get(dataset, {}).keys())
 
     if region is None:
-        return pd.DataFrame({"region": regions})
+        return pl.DataFrame({"region": regions})
 
     if region not in regions:
         raise ValueError(
@@ -308,8 +331,11 @@ def list_supported_jkp_factors(
             "list_supported_jkp_factors() to see valid regions."
         )
 
-    return pd.DataFrame(
-        {"region": region, "factor": availability[dataset][region]}
+    return pl.DataFrame(
+        {
+            "region": [region] * len(availability[dataset][region]),
+            "factor": availability[dataset][region],
+        }
     )
 
 
@@ -406,7 +432,7 @@ def open_tidy_finance_website(chapter: str = None) -> None:
     webbrowser.open(final_url)
 
 
-def winsorize(x: np.ndarray, cut: float) -> np.ndarray:
+def winsorize(x, cut: float) -> np.ndarray:
     """Winsorize a numeric vector at symmetric quantiles.
 
     Replaces values below the lower 'cut' quantile and above the upper
@@ -415,9 +441,9 @@ def winsorize(x: np.ndarray, cut: float) -> np.ndarray:
 
     Parameters
     ----------
-    x : numpy.ndarray
+    x : numpy.ndarray or polars.Series
         A numeric vector to winsorize. Inputs that are not already
-        arrays are coerced via 'numpy.array'.
+        arrays are coerced via 'numpy.asarray'.
     cut : float
         Proportion of observations replaced at each tail. For example,
         'cut=0.05' clips the lowest and highest five percent. Must lie
@@ -439,9 +465,10 @@ def winsorize(x: np.ndarray, cut: float) -> np.ndarray:
     winsorized = winsorize(data, 0.05)
     ```
     """
+    if isinstance(x, pl.Series):
+        x = x.to_numpy()
     if not isinstance(x, np.ndarray):
-        x = np.array(x)
-        # raise ValueError("x must be an numpy array")
+        x = np.asarray(x)
 
     if not (0 <= cut <= 0.5):
         raise ValueError("'cut' must be inside [0, 0.5].")
@@ -449,13 +476,12 @@ def winsorize(x: np.ndarray, cut: float) -> np.ndarray:
     if x.size == 0:
         return x
 
-    x = np.array(x)  # Convert input to numpy array if not already
-    lb, ub = np.nanquantile(x, [cut, 1 - cut])  # Compute quantiles
-    x = np.clip(x, lb, ub)  # Winsorize values
-    return x
+    x = np.asarray(x, dtype=float)
+    lb, ub = np.nanquantile(x, [cut, 1 - cut])
+    return np.clip(x, lb, ub)
 
 
-def trim(x: np.ndarray, cut: float) -> np.ndarray:
+def trim(x, cut: float) -> np.ndarray:
     """Trim a numeric vector by removing extreme observations.
 
     Drops values below the lower 'cut' quantile and above the upper
@@ -464,7 +490,7 @@ def trim(x: np.ndarray, cut: float) -> np.ndarray:
 
     Parameters
     ----------
-    x : numpy.ndarray
+    x : numpy.ndarray or polars.Series
         A numeric vector to trim.
     cut : float
         Proportion of observations removed at each tail. For example,
@@ -486,6 +512,11 @@ def trim(x: np.ndarray, cut: float) -> np.ndarray:
     trimmed = trim(data, 0.05)
     ```
     """
+    if isinstance(x, pl.Series):
+        x = x.to_numpy()
+    if not isinstance(x, np.ndarray):
+        x = np.asarray(x)
+
     if not (0 <= cut <= 0.5):
         raise ValueError("'cut' must be inside [0, 0.5].")
 

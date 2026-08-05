@@ -1,10 +1,11 @@
 """Tests for compute_portfolio_returns."""
 
+import datetime as dt
 import os
 import sys
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -16,23 +17,35 @@ from tidyfinance.portfolios import breakpoint_options, compute_portfolio_returns
 # %% test data helper
 
 
+def _month_starts(start: str, n_months: int) -> list:
+    """Return 'n_months' consecutive month-start dates from 'start'."""
+    first = dt.date.fromisoformat(start)
+    offsets = [first.month - 1 + i for i in range(n_months)]
+    return [
+        dt.date(first.year + offset // 12, offset % 12 + 1, 1)
+        for offset in offsets
+    ]
+
+
 def make_data(
     n_stocks=30, n_months=6, start="2020-01-01", seed=42, with_mktcap=True
 ):
     """Construct a stock-month panel for tests."""
     rng = np.random.default_rng(seed)
-    dates = pd.date_range(start=start, periods=n_months, freq="MS")
-    df = pd.DataFrame(
-        [(permno, date) for date in dates for permno in range(1, n_stocks + 1)],
-        columns=["permno", "date"],
-    )
-    n = len(df)
-    df["ret_excess"] = rng.standard_normal(n)
-    df["size"] = rng.uniform(50, 150, n)
-    df["bm"] = rng.uniform(0.5, 2, n)
+    dates = _month_starts(start, n_months)
+    permnos = [permno for _ in dates for permno in range(1, n_stocks + 1)]
+    date_col = [date for date in dates for _ in range(n_stocks)]
+    n = len(permnos)
+    columns = {
+        "permno": permnos,
+        "date": date_col,
+        "ret_excess": rng.standard_normal(n),
+        "size": rng.uniform(50, 150, n),
+        "bm": rng.uniform(0.5, 2, n),
+    }
     if with_mktcap:
-        df["mktcap_lag"] = rng.uniform(100, 1000, n)
-    return df
+        columns["mktcap_lag"] = rng.uniform(100, 1000, n)
+    return pl.DataFrame(columns)
 
 
 bp3 = breakpoint_options(n_portfolios=3)
@@ -162,9 +175,10 @@ def test_univariate_periodic_with_mktcap_returns_all_ret_cols():
 
 
 def test_all_na_mktcap_lag_gives_na_value_weighted_returns():
-    """Test all-NaN mktcap_lag gives NaN value-weighted returns."""
-    data = make_data()
-    data["mktcap_lag"] = np.nan
+    """Test all-missing mktcap_lag gives null value-weighted returns."""
+    data = make_data().with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("mktcap_lag")
+    )
     result = compute_portfolio_returns(
         data,
         "size",
@@ -172,13 +186,14 @@ def test_all_na_mktcap_lag_gives_na_value_weighted_returns():
         breakpoint_options_main=bp3,
         quiet=True,
     )
-    assert result["ret_excess_vw"].isna().all()
+    assert result["ret_excess_vw"].is_null().all()
 
 
 def test_all_na_sorting_var_emits_message_and_returns_0_rows():
-    """Test all-NaN sorting variable emits warning and returns 0 rows."""
-    data = make_data()
-    data["size"] = np.nan
+    """Test all-missing sorting variable warns and returns 0 rows."""
+    data = make_data().with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("size")
+    )
     with pytest.warns(UserWarning, match="empty panel"):
         result = compute_portfolio_returns(
             data,
@@ -225,12 +240,12 @@ def test_univariate_annual_rebalancing_produces_valid_output():
         breakpoint_options_main=bp3,
         quiet=True,
     )
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) > 0
 
 
 def test_min_portfolio_size_produces_nas_and_emits_message():
-    """Test min_portfolio_size produces NaNs and emits warning."""
+    """Test min_portfolio_size produces nulls and emits warning."""
     with pytest.warns(UserWarning, match="missing"):
         result = compute_portfolio_returns(
             make_data(n_stocks=5),
@@ -239,7 +254,7 @@ def test_min_portfolio_size_produces_nas_and_emits_message():
             breakpoint_options_main=bp3,
             min_portfolio_size=10,
         )
-    assert result["ret_excess_ew"].isna().any()
+    assert result["ret_excess_ew"].is_null().any()
 
 
 # %% bivariate-dependent
@@ -267,7 +282,7 @@ def test_bivariate_dependent_periodic_produces_valid_output():
         breakpoint_options_secondary=bp2,
         quiet=True,
     )
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) > 0
 
 
@@ -282,7 +297,7 @@ def test_bivariate_dependent_annual_produces_valid_output():
         breakpoint_options_secondary=bp2,
         quiet=True,
     )
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) > 0
 
 
@@ -301,9 +316,10 @@ def test_bivariate_dependent_annual_no_match_raises_early_error():
 
 
 def test_all_na_mktcap_in_bivariate_coerces_nan_vw_to_na():
-    """Test all-NaN mktcap in bivariate produces NaN vw returns."""
-    data = make_data()
-    data["mktcap_lag"] = np.nan
+    """Test all-missing mktcap in bivariate produces null vw returns."""
+    data = make_data().with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("mktcap_lag")
+    )
     result = compute_portfolio_returns(
         data,
         ["size", "bm"],
@@ -312,7 +328,7 @@ def test_all_na_mktcap_in_bivariate_coerces_nan_vw_to_na():
         breakpoint_options_secondary=bp2,
         quiet=True,
     )
-    assert result["ret_excess_vw"].isna().all()
+    assert result["ret_excess_vw"].is_null().all()
 
 
 # %% bivariate-independent
@@ -340,7 +356,7 @@ def test_bivariate_independent_periodic_produces_valid_output():
         breakpoint_options_secondary=bp2,
         quiet=True,
     )
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) > 0
 
 
@@ -355,7 +371,7 @@ def test_bivariate_independent_annual_produces_valid_output():
         breakpoint_options_secondary=bp2,
         quiet=True,
     )
-    assert isinstance(result, pd.DataFrame)
+    assert isinstance(result, pl.DataFrame)
     assert len(result) > 0
 
 

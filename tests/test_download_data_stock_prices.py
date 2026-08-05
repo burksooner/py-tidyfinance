@@ -4,14 +4,16 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 )
 
-from tidyfinance.download_open_source import _download_data_stock_prices  # noqa: E402
+from tidyfinance.download_open_source import (  # noqa: E402
+    _download_data_stock_prices,
+)
 
 
 def test_symbols_must_be_a_character_vector_without_missing_values():
@@ -65,7 +67,9 @@ def test_downloads_data_replaces_null_and_warns_on_failures():
             resp.json.return_value = success_body
         return resp
 
-    with patch("tidyfinance.download_open_source.requests.get", side_effect=fake_get):
+    with patch(
+        "tidyfinance.download_open_source.requests.get", side_effect=fake_get
+    ):
         with pytest.warns(
             UserWarning, match="Failed to retrieve data for symbol FAIL"
         ):
@@ -73,18 +77,19 @@ def test_downloads_data_replaces_null_and_warns_on_failures():
                 ["AAPL", "FAIL"], "2020-01-01", "2020-01-03"
             )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     # Two AAPL rows are kept; the row with a NULL upstream value
-    # retains NaN rather than being dropped. FAIL is silently skipped.
-    assert list(out["symbol"]) == ["AAPL", "AAPL"]
-    assert list(out["open"]) == [10, 11]
-    assert list(out["low"]) == [9, 10]
-    assert list(out["high"]) == [12, 13]
-    assert list(out["close"]) == [11, 12]
-    assert out["volume"].iloc[0] == 100
-    assert pd.isna(out["volume"].iloc[1])
-    assert out["adjusted_close"].iloc[0] == 11
-    assert pd.isna(out["adjusted_close"].iloc[1])
+    # retains a null rather than being dropped. FAIL is silently
+    # skipped.
+    assert out["symbol"].to_list() == ["AAPL", "AAPL"]
+    assert out["open"].to_list() == [10, 11]
+    assert out["low"].to_list() == [9, 10]
+    assert out["high"].to_list() == [12, 13]
+    assert out["close"].to_list() == [11, 12]
+    assert out["volume"][0] == 100
+    assert out["volume"][1] is None
+    assert out["adjusted_close"][0] == 11
+    assert out["adjusted_close"][1] is None
 
 
 if __name__ == "__main__":

@@ -8,26 +8,38 @@ authors = [{name = "Christoph Frey", email = "christoph.frey@gmail.com"},
 	   {name = "Christoph Scheuch", email = "christoph@tidy-intelligence.com"},
        {name = "Stefan Voigt", email = "stefan.voigt@econ.ku.dk"}
            ]
-version = "0.4.0"
+version = "0.5.0"
 description = "Tidy Finance Helper Functions"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
+    # Core data frame library; the package computes in polars.
+    "polars>=1.0.0",
+    # Default backend of the public API; pandas<->polars conversion at
+    # the package boundary goes through pyarrow.
     "pandas>=2.2.0",
-    "numpy>=1.26.0",
-    "sqlalchemy>=2.0.21",
-    "requests>=2.32.4",
     "pyarrow>=19.0.1",
-    "psycopg2-binary>=2.9.9",
-    "dotenv>=0.9.9",
+    "numpy>=1.26.0",
+    # HTTP downloads (impersonation needed by several data providers).
     "curl_cffi>=0.10.0",
-    "lxml>=5.3.1",
+    # WRDS access: SQLAlchemy engine + PostgreSQL driver + .env
+    # credentials (mirrors RPostgres/DBI in r-tidyfinance's Imports).
+    "sqlalchemy>=2.0.21",
+    "psycopg2-binary>=2.9.9",
+    "python-dotenv>=1.0.0",
+    # Design matrices for the regression functions.
     "formulaic>=1.0.0",
 ]
 
 [project.optional-dependencies]
+# Kept for backward compatibility: polars is a core dependency since
+# the 0.5.0 rewrite, so this extra is a no-op.
 polars = ["polars>=1.0.0"]
+# Only needed by get_available_famafrench_datasets, which scrapes the
+# Kenneth French data library page and degrades with a clear
+# ImportError when lxml is absent.
+scraping = ["lxml>=5.3.1"]
 
 [dependency-groups]
 dev = [

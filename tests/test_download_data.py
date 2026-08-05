@@ -4,7 +4,7 @@ import os
 import sys
 from unittest.mock import patch
 
-import pandas as pd
+import polars as pl
 import pytest
 
 sys.path.insert(
@@ -90,8 +90,8 @@ def test_download_data_pseudo_dispatches_to_simulate():
             end_date="2020-03-31",
             n_assets=3,
         )
-    assert isinstance(result, pd.DataFrame)
-    assert not result.empty
+    assert isinstance(result, pl.DataFrame)
+    assert not result.is_empty()
     assert {"permno", "date", "ret"}.issubset(result.columns)
 
 

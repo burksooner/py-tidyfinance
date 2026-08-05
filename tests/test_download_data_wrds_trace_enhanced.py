@@ -1,10 +1,10 @@
 """Tests for download_data_wrds_trace_enhanced."""
 
+import datetime as dt
 import os
 import sys
 from unittest.mock import patch
 
-import pandas as pd
 import polars as pl
 import pytest
 
@@ -33,8 +33,8 @@ def test_download_data_wrds_trace_enhanced_validates_cusips():
 
 def test_download_data_wrds_trace_enhanced_cleans_trace_data():
     """Test download_data_wrds_trace_enhanced cleans TRACE data."""
-    d1 = pd.Timestamp("2013-01-02")
-    d0 = pd.Timestamp("2011-01-02")
+    d1 = dt.date(2013, 1, 2)
+    d0 = dt.date(2011, 1, 2)
 
     def row(
         msg,
@@ -53,7 +53,7 @@ def test_download_data_wrds_trace_enhanced_cleans_trace_data():
         spcl="",
     ):
         if stlmnt is None:
-            stlmnt = date + pd.Timedelta(days=1)
+            stlmnt = date + dt.timedelta(days=1)
         return {
             "cusip_id": "00101JAH9",
             "msg_seq_nb": msg,
@@ -96,7 +96,7 @@ def test_download_data_wrds_trace_enhanced_cleans_trace_data():
             d1,
             d1,
             "T",
-            stlmnt=d1 + pd.Timedelta(days=8),
+            stlmnt=d1 + dt.timedelta(days=8),
         ),
         row(18, None, 107, 99, "B", "C", d1, d1, "T", wis="Y"),
         row(19, None, 108, 99, "B", "C", d1, d1, "T", spcl="Y"),
@@ -110,24 +110,26 @@ def test_download_data_wrds_trace_enhanced_cleans_trace_data():
         row(30, None, 301, 99, "B", "C", d0, d0, "T"),
         row(31, None, 301, 99, "B", "C", d0, d0, "T", asof="R"),
     ]
-    trace = pd.DataFrame(rows)
+    trace = pl.DataFrame(
+        rows, schema_overrides={"orig_msg_seq_nb": pl.Int64}
+    )
 
     with (
         patch(
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
-        patch("tidyfinance.download_wrds.pd.read_sql", return_value=trace),
+        patch("tidyfinance.download_wrds._read_sql", return_value=trace),
     ):
         out = _download_data_wrds_trace_enhanced(
             ["00101JAH9"], "2010-01-01", "2014-01-01"
         )
 
-    assert isinstance(out, pd.DataFrame)
+    assert isinstance(out, pl.DataFrame)
     # The cleaning pipeline should yield 4 rows mirroring R behavior
     # (volumes 204, 100, 103, 104). Allow slight variation in row ordering.
     expected_vols = {204, 100, 103, 104}
-    actual_vols = set(out["entrd_vol_qt"].tolist())
+    actual_vols = set(out["entrd_vol_qt"].to_list())
     assert expected_vols.issubset(actual_vols) or actual_vols.issubset(
         expected_vols
     )
@@ -138,8 +140,8 @@ def test_download_data_trace_enhanced_polars_returns_date_columns():
     the cleaned TRACE output) must come out as polars Date so it
     joins/stacks against Date-typed frames, while the time column stays
     untouched (issue #66)."""
-    d = pd.Timestamp("2019-01-02")
-    trace = pd.DataFrame(
+    d = dt.datetime(2019, 1, 2)
+    trace = pl.DataFrame(
         [
             {
                 "cusip_id": "00101JAH9",
@@ -161,10 +163,11 @@ def test_download_data_trace_enhanced_polars_returns_date_columns():
                 "days_to_sttl_ct": 1,
                 "lckd_in_ind": "",
                 "sale_cndtn_cd": "",
-                "stlmnt_dt": d + pd.Timedelta(days=1),
+                "stlmnt_dt": d + dt.timedelta(days=1),
                 "spcl_trd_fl": "",
             }
-        ]
+        ],
+        schema_overrides={"orig_msg_seq_nb": pl.Int64},
     )
 
     tf.set_backend("polars")
@@ -173,7 +176,7 @@ def test_download_data_trace_enhanced_polars_returns_date_columns():
             "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
         ),
         patch("tidyfinance.download_wrds.disconnect_connection"),
-        patch("tidyfinance.download_wrds.pd.read_sql", return_value=trace),
+        patch("tidyfinance.download_wrds._read_sql", return_value=trace),
     ):
         out = tf.download_data(
             domain="WRDS",
@@ -198,7 +201,7 @@ def test_process_trace_data_uses_2012_02_06_regime_cutoff():
     pre-2012, where the post-2012 cancellation logic (trc_st == 'X') is not
     applied. This is a regression test for that transposition.
     """
-    d = pd.Timestamp("2012-04-01")  # inside [2012-02-06, 2012-06-02)
+    d = dt.date(2012, 4, 1)  # inside [2012-02-06, 2012-06-02)
 
     def row(msg, vol, status):
         return {
@@ -218,20 +221,21 @@ def test_process_trace_data_uses_2012_02_06_regime_cutoff():
             "asof_cd": "",
             "wis_fl": "N",
             "days_to_sttl_ct": 1,
-            "stlmnt_dt": d + pd.Timedelta(days=1),
+            "stlmnt_dt": d + dt.timedelta(days=1),
             "spcl_trd_fl": "",
         }
 
-    trace = pd.DataFrame(
+    trace = pl.DataFrame(
         [
             row(10, 100, "T"),  # trade, cancelled by the X below (post regime)
             row(10, 100, "X"),  # post-2012 cancellation of msg 10
             row(11, 200, "T"),  # untouched control trade
-        ]
+        ],
+        schema_overrides={"orig_msg_seq_nb": pl.Int64},
     )
 
     out = process_trace_data(trace)
-    vols = set(out["entrd_vol_qt"].tolist())
+    vols = set(out["entrd_vol_qt"].to_list())
 
     # Post-2012 regime: the X cancels the trade -> 100 removed, 200 kept.
     # With the transposed cutoff this window was treated as pre-2012, the

@@ -2,7 +2,7 @@
 
 import warnings
 
-import pandas as pd
+import polars as pl
 
 from .download_open_source import (
     _download_data_constituents,
@@ -38,7 +38,7 @@ def download_data(
     end_date: str = None,
     type: str = None,
     **kwargs,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Download and process data based on domain and dataset.
 
@@ -93,7 +93,7 @@ def download_data(
 
     Returns
     -------
-    pd.DataFrame
+    pl.DataFrame
         A data frame with processed data, including dates and the
         relevant financial metrics, filtered by the specified date
         range.
