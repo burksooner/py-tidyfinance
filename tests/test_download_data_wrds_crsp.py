@@ -400,6 +400,54 @@ def test_monthly_crsp_v1_is_processed():
     assert abs(out["mktcap"][0] - 0.05) < 1e-12
 
 
+def test_monthly_crsp_v1_ccm_links_with_float_permno():
+    """WRDS stores v1 permno as double precision; the read paths must
+    cast it so the join with the Int64-permno ccm link table works."""
+    as_float = pl.col("permno").cast(pl.Float64)
+    msf_data = _mock_monthly_v1_msf().with_columns(as_float)
+    msedelist = _mock_monthly_v1_msedelist().with_columns(as_float)
+    first_crsp_date = _mock_monthly_v1_first_crsp_date().with_columns(
+        as_float
+    )
+    ccm_links = pl.DataFrame(
+        {
+            "permno": pl.Series([1], dtype=pl.Int64),
+            "gvkey": ["001"],
+            "linkdt": [dt.date(2019, 1, 1)],
+            "linkenddt": [dt.date(2020, 12, 31)],
+        }
+    )
+
+    with (
+        patch(
+            "tidyfinance.download_wrds.get_wrds_connection", return_value="con"
+        ),
+        patch("tidyfinance.download_wrds.disconnect_connection"),
+        patch(
+            "tidyfinance.download_wrds._read_sql",
+            side_effect=[msf_data, msedelist, first_crsp_date],
+        ),
+        patch(
+            "tidyfinance.download_wrds._download_data_risk_free",
+            return_value=_mock_risk_free_monthly(),
+        ),
+        patch(
+            "tidyfinance.download_wrds._download_data_wrds_ccm_links",
+            return_value=ccm_links,
+        ),
+    ):
+        out = _download_data_wrds_crsp(
+            dataset="crsp_monthly",
+            start_date="2020-01-01",
+            end_date="2020-12-31",
+            version="v1",
+            add_ccm_links=True,
+        )
+
+    assert "gvkey" in out.columns
+    assert out["permno"].dtype == pl.Int64
+
+
 def _mock_daily_v1_dsf():
     """Mock crsp.dsf + msenames join for v1."""
     return pl.DataFrame(

@@ -246,6 +246,12 @@ def _to_offset(x) -> str:
                 f"{unsupported}. Use years, months, weeks, or days."
             )
         n = getattr(x, "n", 1)
+        if not x.kwds:
+            # pd.DateOffset(k) without keyword components means k
+            # calendar days in pandas.
+            if n < 0:
+                raise ValueError("lag/max_lag must be non-negative.")
+            return f"{n}d"
         unit_map = {"years": "y", "months": "mo", "weeks": "w", "days": "d"}
         parts = []
         for k in allowed:

@@ -457,16 +457,24 @@ def _download_data_wrds_crsp(
                     WHERE msf.date BETWEEN '{start_date}'
                           AND '{end_date}'
                 """
-                msf_data = _cast_date_columns(
-                    _read_sql(msf_query, wrds_connection), ["date"]
+                # WRDS stores v1 permno as double precision; cast to
+                # Int64 so joins (e.g. with ccm links) match dtypes.
+                msf_data = _cast_columns(
+                    _cast_date_columns(
+                        _read_sql(msf_query, wrds_connection), ["date"]
+                    ),
+                    {"permno": pl.Int64, "siccd": pl.Int64},
                 )
 
                 # Query 2: msedelist (delisting events)
                 msedelist_query = (
                     "SELECT permno, dlstdt, dlret, dlstcd FROM crsp.msedelist"
                 )
-                msedelist = _cast_date_columns(
-                    _read_sql(msedelist_query, wrds_connection), ["dlstdt"]
+                msedelist = _cast_columns(
+                    _cast_date_columns(
+                        _read_sql(msedelist_query, wrds_connection), ["dlstdt"]
+                    ),
+                    {"permno": pl.Int64},
                 )
 
                 # Query 3: first_crsp_date per permno
@@ -474,9 +482,12 @@ def _download_data_wrds_crsp(
                     "SELECT permno, MIN(namedt) AS first_crsp_date "
                     "FROM crsp.msenames GROUP BY permno"
                 )
-                first_crsp_date = _cast_date_columns(
-                    _read_sql(first_date_query, wrds_connection),
-                    ["first_crsp_date"],
+                first_crsp_date = _cast_columns(
+                    _cast_date_columns(
+                        _read_sql(first_date_query, wrds_connection),
+                        ["first_crsp_date"],
+                    ),
+                    {"permno": pl.Int64},
                 )
 
                 disconnect_connection(wrds_connection)
@@ -720,8 +731,14 @@ def _download_data_wrds_crsp(
                             AND dsf.date BETWEEN '{start_date}'
                                 AND '{end_date}'
                         """
-                        crsp_daily_sub = _cast_date_columns(
-                            _read_sql(dsf_query, wrds_connection), ["date"]
+                        # WRDS stores v1 permno as double precision;
+                        # cast to Int64 so joins match dtypes.
+                        crsp_daily_sub = _cast_columns(
+                            _cast_date_columns(
+                                _read_sql(dsf_query, wrds_connection),
+                                ["date"],
+                            ),
+                            {"permno": pl.Int64},
                         ).drop_nulls(subset=["permno", "date", "ret"])
 
                         if crsp_daily_sub.is_empty():
@@ -733,9 +750,12 @@ def _download_data_wrds_crsp(
                             "FROM crsp.msedelist "
                             f"WHERE permno IN {permno_in}"
                         )
-                        msedelist_sub = _cast_date_columns(
-                            _read_sql(msedelist_query, wrds_connection),
-                            ["dlstdt"],
+                        msedelist_sub = _cast_columns(
+                            _cast_date_columns(
+                                _read_sql(msedelist_query, wrds_connection),
+                                ["dlstdt"],
+                            ),
+                            {"permno": pl.Int64},
                         ).drop_nulls()
 
                         # Merge dsf with msedelist on (permno, date=dlstdt)

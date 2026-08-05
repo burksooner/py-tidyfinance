@@ -310,6 +310,40 @@ def test_series_returning_function_matches_backend():
     assert isinstance(result, pl.Series)
 
 
+def test_series_output_aligns_with_input_frame_index():
+    """Row-aligned Series outputs carry the pandas input's index, so
+    'df["pf"] = tf.assign_portfolio(df, ...)' on a filtered frame with
+    a non-default index does not misalign rows."""
+    rng = np.random.default_rng(42)
+    data = pd.DataFrame(
+        {
+            "exchange": ["NYSE", "NASDAQ"] * 50,
+            "mktcap": rng.random(100),
+        }
+    )
+    sub = data[data["exchange"] == "NYSE"]
+    result = tf.assign_portfolio(
+        sub, "mktcap", breakpoint_options={"n_portfolios": 5}
+    )
+    assert isinstance(result, pd.Series)
+    assert result.index.equals(sub.index)
+
+
+def test_day_count_dateoffset_lags_by_days():
+    """'pd.DateOffset(k)' without keyword components means k days in
+    pandas; it must not collapse to a zero lag."""
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(pd.date_range("2020-01-01", periods=5)),
+            "size": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+    out = tf.add_lagged_columns(df, cols="size", lag=pd.DateOffset(2))
+    expected = tf.add_lagged_columns(df, cols="size", lag="2d")
+    pd.testing.assert_frame_equal(out, expected)
+    assert out["size_lag"].iloc[2] == 1.0
+
+
 # %% boundary-only wrapping protects internal cross-calls
 
 

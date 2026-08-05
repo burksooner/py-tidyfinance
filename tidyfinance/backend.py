@@ -161,7 +161,7 @@ def _to_polars_input(obj):
     return obj
 
 
-def _convert_output(obj):
+def _convert_output(obj, index=None):
     """Convert a polars object to the active backend.
 
     With the '"polars"' backend the object is returned unchanged. With
@@ -171,12 +171,18 @@ def _convert_output(obj):
     pandas conventions. Dict values are converted recursively (e.g.
     'estimate_model' with multiple outputs). Anything else (arrays,
     lists, scalars) passes through unchanged.
+
+    When 'index' (the index of the pandas input) is given, a Series
+    output of the same length receives it, so that row-aligned outputs
+    such as 'assign_portfolio' align with the input frame under
+    pandas-style assignment (e.g. 'df["pf"] = assign_portfolio(df, ...)'
+    on a filtered frame with a non-default index).
     """
     if get_backend() != "pandas":
         return obj
 
     if isinstance(obj, dict):
-        return {k: _convert_output(v) for k, v in obj.items()}
+        return {k: _convert_output(v, index=index) for k, v in obj.items()}
 
     if isinstance(obj, pl.DataFrame):
         out = obj.to_pandas()
@@ -199,6 +205,8 @@ def _convert_output(obj):
             and str(dtype) != "datetime64[ns]"
         ):
             out = out.astype("datetime64[ns]")
+        if index is not None and len(index) == len(out):
+            out.index = index
         return out
 
     return obj
@@ -217,8 +225,15 @@ def _use_backend(func):
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        # Remember the index of the first pandas input so row-aligned
+        # Series outputs can be re-aligned with it on conversion.
+        index = None
+        for value in (*args, *kwargs.values()):
+            if _is_pandas_obj(value):
+                index = value.index
+                break
         args = tuple(_to_polars_input(a) for a in args)
         kwargs = {k: _to_polars_input(v) for k, v in kwargs.items()}
-        return _convert_output(func(*args, **kwargs))
+        return _convert_output(func(*args, **kwargs), index=index)
 
     return wrapper

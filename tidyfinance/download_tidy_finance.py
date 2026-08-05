@@ -192,10 +192,11 @@ def _download_data_risk_free(
 
     risk_free_data = _cast_date_column(risk_free_data)
 
+    # Filter each bound independently so an open-ended range works.
     if start_date is not None:
-        risk_free_data = risk_free_data.filter(
-            (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
-        )
+        risk_free_data = risk_free_data.filter(pl.col("date") >= start_date)
+    if end_date is not None:
+        risk_free_data = risk_free_data.filter(pl.col("date") <= end_date)
 
     return risk_free_data
 

@@ -77,6 +77,36 @@ def test_data_is_filtered_when_start_and_end_dates_are_supplied():
     ]
 
 
+def test_data_is_filtered_with_open_ended_date_ranges():
+    """A single date bound filters that side only instead of silently
+    returning an empty frame."""
+    mock_data = pl.DataFrame(
+        {
+            "date": [
+                dt.date(2020, 1, 1),
+                dt.date(2020, 2, 1),
+                dt.date(2020, 3, 1),
+            ],
+            "risk_free": [0.001, 0.002, 0.003],
+        }
+    )
+    with patch(
+        "tidyfinance.download_tidy_finance._read_parquet_url",
+        return_value=mock_data,
+    ):
+        from_feb = _download_data_risk_free(start_date="2020-02-01")
+        until_feb = _download_data_risk_free(end_date="2020-02-01")
+
+    assert from_feb["date"].to_list() == [
+        dt.date(2020, 2, 1),
+        dt.date(2020, 3, 1),
+    ]
+    assert until_feb["date"].to_list() == [
+        dt.date(2020, 1, 1),
+        dt.date(2020, 2, 1),
+    ]
+
+
 def test_datetime_date_column_is_cast_to_date():
     """Test a datetime-typed date column is normalized to pl.Date."""
     mock_data = pl.DataFrame(
