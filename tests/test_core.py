@@ -202,14 +202,22 @@ def test_estimate_rolling_betas_basic(sample_data: pl.DataFrame) -> None:
 
 
 def test_estimate_rolling_betas_min_obs(sample_data: pl.DataFrame) -> None:
+    """Windows with fewer than min_obs observations are dropped from
+    the output rather than returned as null rows."""
     lookback = "30d"
     min_obs = 10
+    full = estimate_betas(
+        sample_data, "ret_excess ~ mkt_excess", lookback, min_obs=1
+    )
     result = estimate_betas(
         sample_data, "ret_excess ~ mkt_excess", lookback, min_obs=min_obs
     )
     assert result.height > 0, "Result should have valid estimates"
-    assert result["beta_mkt_excess"].is_null().sum() > 0, (
-        "Some estimates should be null due to min_obs constraint"
+    assert result["beta_mkt_excess"].is_null().sum() == 0, (
+        "Sub-min_obs windows should be dropped, not null"
+    )
+    assert result.height < full.height, (
+        "min_obs should remove the early sub-min_obs windows"
     )
 
 
@@ -299,7 +307,7 @@ def test_estimate_betas_invalid_formula_raises(
         estimate_betas(sample_data, "ret_excess mkt_excess", "30d")
 
 
-# %% estimate_betas: calendar vs positional windows (r-tidyfinance parity)
+# %% estimate_betas: calendar vs positional windows
 
 
 def _gappy_monthly_panel() -> pl.DataFrame:
@@ -378,6 +386,9 @@ def test_calendar_and_positional_agree_on_balanced_panels() -> None:
         positional = estimate_betas(
             data, "ret_excess ~ mkt_excess", lookback=12, min_obs=10
         )
+    # The calendar path drops sub-min_obs windows;
+    # the deprecated positional path keeps them as null rows.
+    positional = positional.filter(pl.col("beta_mkt_excess").is_not_null())
     assert_frame_equal(calendar, positional)
 
 
@@ -399,8 +410,10 @@ def test_calendar_lookback_pools_observations_within_a_period() -> None:
         data, "ret_excess ~ mkt_excess", lookback="3mo", min_obs=40
     )
 
-    # One row per month, dated at the start of the month.
-    assert result.height == data["date"].dt.truncate("1mo").n_unique()
+    # One row per month, dated at the start of the month. The first
+    # month (Jan 2020) has fewer than min_obs=40 observations in its
+    # trailing window and is dropped.
+    assert result.height == data["date"].dt.truncate("1mo").n_unique() - 1
     assert result["date"].to_list() == sorted(result["date"].to_list())
     assert all(d.day == 1 for d in result["date"].to_list())
 
@@ -440,8 +453,8 @@ def test_subday_lookback_requires_datetime_column(
 
 
 def test_default_min_obs_rounds_like_r() -> None:
-    """min_obs defaults to round(0.8 * lookback), not the truncation
-    that used to differ from r-tidyfinance (6 -> 5, not 4)."""
+    """min_obs defaults to round(0.8 * lookback), not truncation
+    (6 -> 5, not 4)."""
     dates = _month_starts(dt.date(2020, 1, 1), 12)
     rng = np.random.default_rng(11)
     data = pl.DataFrame(
@@ -633,8 +646,8 @@ def test_newey_west_se_legacy_path_equals_statsmodels_hac() -> None:
 
 
 def _sample_data_fmb_parity() -> pl.DataFrame:
-    """Deterministic panel; reference values produced by r-tidyfinance's
-    estimate_fama_macbeth (vcov='newey-west') on the identical data."""
+    """Deterministic panel; reference values produced in R
+    (vcov='newey-west') on the identical data."""
     rng = np.random.default_rng(987654)
     dates = _month_ends(2000, 1, 48)
     recs = []
@@ -654,7 +667,8 @@ def _sample_data_fmb_parity() -> pl.DataFrame:
 
 
 def test_estimate_fama_macbeth_newey_west_matches_r() -> None:
-    """End-to-end Fama-MacBeth t-statistics match r-tidyfinance exactly.
+    """End-to-end Fama-MacBeth t-statistics match the R reference
+    values exactly.
 
     Reference (sandwich::NeweyWest default) rounded to 3 decimals:
     intercept -0.792, beta 2.301, bm 1.005, size 0.887.

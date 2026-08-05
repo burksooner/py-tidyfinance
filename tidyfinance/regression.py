@@ -119,8 +119,7 @@ def _fit_ols(model: str, data: pl.DataFrame) -> _OLSFit:
     return _OLSFit(names, beta, se, tstat, resid, r_squared, adj_r_squared, n)
 
 
-# Rolling-window units accepted by 'estimate_betas', mirroring the
-# lubridate Periods that r-tidyfinance's 'estimate_betas' accepts
+# Rolling-window units accepted by 'estimate_betas'
 # (months, days, hours, minutes, seconds). The keys are the polars
 # duration abbreviations, so '60mo' reads like the '1mo' offsets used
 # elsewhere in the package.
@@ -148,8 +147,8 @@ _LOOKBACK_RE = re.compile(r"^(\d+)(mo|d|h|m|s)$")
 def _parse_lookback(lookback) -> tuple[int, str | None]:
     """Resolve 'lookback' into a window length and a calendar unit.
 
-    A string such as '60mo' selects a calendar window of 60 months,
-    matching r-tidyfinance's 'months(60)'. A bare integer selects the
+    A string such as '60mo' selects a calendar window of 60 months.
+    A bare integer selects the
     legacy positional window (a count of consecutive observations) and
     is deprecated.
 
@@ -168,8 +167,7 @@ def _parse_lookback(lookback) -> tuple[int, str | None]:
             raise ValueError(
                 f"Invalid 'lookback' {lookback!r}. Use a positive count "
                 "followed by one of 'mo', 'd', 'h', 'm', 's' (e.g. "
-                "'60mo' for 60 months), mirroring r-tidyfinance's "
-                "months(60)."
+                "'60mo' for 60 months)."
             )
         length = int(match.group(1))
         if length <= 0:
@@ -181,8 +179,8 @@ def _parse_lookback(lookback) -> tuple[int, str | None]:
             raise ValueError("'lookback' must be positive.")
         warnings.warn(
             "Passing 'lookback' as an integer counts consecutive "
-            "observations, which differs from r-tidyfinance's calendar "
-            "window and is deprecated. Pass a duration string such as "
+            "observations, which differs from the calendar window used "
+            "with duration strings and is deprecated. Pass a duration string such as "
             "'60mo' to roll over calendar periods as R does.",
             DeprecationWarning,
             stacklevel=3,
@@ -198,7 +196,7 @@ def _parse_lookback(lookback) -> tuple[int, str | None]:
 def _period_index_expr(date_col: str, period: str) -> pl.Expr:
     """Integer counter that advances by one per calendar period.
 
-    Mirrors r-tidyfinance's 'period_to_index': months are indexed as
+    Months are indexed as
     'year * 12 + month' rather than by date, which sidesteps
     end-of-month arithmetic.
     """
@@ -225,8 +223,8 @@ def _rolling_moment_betas(
     """Rolling closed-form OLS over a non-decreasing integer index.
 
     Observations that share an index value are pooled into a single
-    window position, as r-tidyfinance does when it collapses the
-    cumulants to one row per entity and period before rolling. Because
+    window position by collapsing the cumulants to one row per entity
+    and period before rolling. Because
     the Gram matrix 'X'X' and the moment vector 'X'y' are additive
     across observations, pooling does not change any estimate; it only
     determines where windows begin and end.
@@ -313,7 +311,7 @@ def estimate_betas(
     Estimates rolling betas for a given model using the provided data.
     For each stock, the regression specified by 'model' is fit over a
     rolling calendar window of length 'lookback' (e.g. '"60mo"' for
-    sixty months), matching r-tidyfinance's 'estimate_betas'.
+    sixty months).
 
     The estimator avoids refitting a full regression for every window.
     Instead it accumulates the per-observation cross-products that
@@ -340,7 +338,7 @@ def estimate_betas(
         Rolling window length. Pass a duration string — a positive
         count followed by one of '"mo"' (months), '"d"' (days),
         '"h"', '"m"', '"s"' — to roll over calendar periods, e.g.
-        '"60mo"'. This mirrors r-tidyfinance's 'months(60)': the window
+        '"60mo"'. The window
         for a period 'v' spans every observation falling in the
         'lookback' periods ending at 'v', so gaps in a stock's history
         consume window space, and one row is returned per stock and
@@ -351,7 +349,7 @@ def estimate_betas(
         row — and emits a 'DeprecationWarning'.
     min_obs : int, optional
         Minimum number of observations required to estimate the model.
-        Defaults to 'round(0.8 * lookback)', as in r-tidyfinance.
+        Defaults to 'round(0.8 * lookback)'.
     id_col : str, default 'permno'
         Column name representing the stock identifier.
 
@@ -362,14 +360,15 @@ def estimate_betas(
         period. Contains the stock identifier and the 'date' column,
         followed by one column per model term: an 'intercept' column
         (when the model includes one) and one 'beta_<variable>' column
-        per regressor, matching r-tidyfinance's 'estimate_betas'.
-        Windows with fewer than 'min_obs' observations yield null
-        coefficients.
+        per regressor.
 
         With a calendar 'lookback' there is one row per stock and
-        period, and 'date' is floored to the start of the period. With
-        the deprecated integer 'lookback' there is one row per input
-        row, and 'date' is the observation's own date.
+        period, 'date' is floored to the start of the period, and
+        windows with fewer than 'min_obs' observations are dropped
+        from the output. With the deprecated
+        integer 'lookback' there is one row per input row, 'date' is
+        the observation's own date, and sub-'min_obs' windows yield
+        null coefficients.
 
     Examples
     --------
@@ -396,16 +395,16 @@ def estimate_betas(
     length, period = _parse_lookback(lookback)
 
     if min_obs is None:
-        # r-tidyfinance rounds; truncating here used to make the default
-        # differ from R whenever 0.8 * lookback had a fractional part
-        # of .6 or .8 (e.g. lookback 6 gave 4 instead of 5).
+        # Round rather than truncate: truncation shifted the default
+        # whenever 0.8 * lookback had a fractional part of .6 or .8
+        # (e.g. lookback 6 gave 4 instead of 5).
         min_obs = int(round(length * 0.8))
     elif min_obs <= 0:
         raise ValueError("min_obs must be a positive integer.")
 
     dep_var, regressors, has_intercept = _parse_linear_formula(model)
 
-    # Column names follow r-tidyfinance: a bare 'intercept' plus one
+    # Column names: a bare 'intercept' plus one
     # 'beta_<variable>' per regressor.
     coef_names = (["intercept"] if has_intercept else []) + [
         f"beta_{name}" for name in regressors
@@ -499,7 +498,16 @@ def estimate_betas(
             }
         )
 
-    return pl.concat(results).select([id_col, "date"] + coef_names)
+    out = pl.concat(results).select([id_col, "date"] + coef_names)
+    if period is not None:
+        # Windows with fewer than 'min_obs' observations are dropped
+        # rather than returned as null rows.
+        # The deprecated integer path keeps one row per input row for
+        # backward compatibility.
+        out = out.filter(
+            ~pl.all_horizontal([pl.col(c).is_null() for c in coef_names])
+        )
+    return out
 
 
 def _betas_frame(
@@ -778,9 +786,6 @@ def estimate_fama_macbeth(
         - 'standard_error' : SE of the time-series mean under 'vcov'
         - 't_statistic' : risk_premium / standard_error
 
-        The column order and the 'intercept' label match
-        r-tidyfinance's 'estimate_fama_macbeth'.
-
         If 'detail' is 'True', a dict with two elements:
 
         - 'coefficients' : the same data frame described above
@@ -908,8 +913,8 @@ def estimate_fama_macbeth(
     # Compute time-series averages, standard errors, t-statistics, and
     # period counts per factor under the chosen vcov. Factors are
     # reported in model-term order (intercept first, then the
-    # regressors as they appear in the formula), matching
-    # r-tidyfinance; 'coef()' is insertion-ordered as in the design
+    # regressors as they appear in the formula); 'coef()' is
+    # insertion-ordered as in the design
     # matrix, so first-appearance order reproduces it.
     factors = list(
         dict.fromkeys(name for coefs in cross_section_coefs for name in coefs)
@@ -948,15 +953,15 @@ def estimate_fama_macbeth(
                 t_stat = np.nan
             else:
                 t_stat = float(estimates.mean()) / float(se)
-        # r-tidyfinance labels the intercept row 'intercept'; formulaic
-        # names the design-matrix column 'Intercept'.
+        # The intercept row is labeled 'intercept'; formulaic names
+        # the design-matrix column 'Intercept'.
         factor_col.append("intercept" if factor == "Intercept" else factor)
         premium_col.append(risk_premium)
         se_col.append(float(se) if se is not None else np.nan)
         t_col.append(t_stat)
         n_col.append(n)
 
-    # Column order follows r-tidyfinance: factor, risk_premium, n,
+    # Column order: factor, risk_premium, n,
     # standard_error, t_statistic.
     result_df = pl.DataFrame(
         {
