@@ -162,7 +162,9 @@ def test_monthly_index_with_thousands_separators_parses():
     Commas appear only after Polars' default infer_schema_length (100),
     so Index is inferred as f64 from early rows and parse fails later.
     """
-    rest = '"2","5","0.01","1","0.4","0.1","0.02","0.05","0.03","0.07","0.04","0.02"'
+    rest = ('"2","5","0.01","1","0.4","0.1","0.02","0.05","0.03","0.07",'
+            '"0.04","0.02"'
+    )
     header = (
         '"yyyymm","Index","D12","E12","Rfree","svar","b/m","ntis",'
         '"tbl","lty","ltr","BAA","AAA","infl"'
