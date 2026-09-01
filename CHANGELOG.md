@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.1 (2026-09-01)
 
 - **Fixed:** Goyal-Welch (macro predictor) CSV parse no longer fails when the S&P Index column uses thousands separators (e.g. `"1,049.34"`). Rows after Polars' default schema-inference window were previously dropped as an empty download.
 
